@@ -1,0 +1,49 @@
+# ============================================================================
+# dsh-magpie · .gitattributes
+# ============================================================================
+# 目的：让 Windows / macOS / Linux 上 checkout 出来的文件字节一致，
+#       避免「我这里好好的」式的换行符 diff 噪音。
+# ============================================================================
+
+# 所有文本文件统一 LF（仓库内），checkout 时也保持 LF。
+# 为什么不用 `autocrlf`：本项目的 `.ps1` / `.cmd` 脚本里有对换行敏感的部分，
+# 显式声明比依赖全局配置可靠。
+* text=auto eol=lf
+
+# ---------------------------------------------------------------------------
+# 明确按二进制处理的类型（Git 不要去 diff / 转行尾）
+# ---------------------------------------------------------------------------
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.woff  binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+*.wasm binary
+*.zip  binary
+*.gz   binary
+*.br   binary
+*.pdf  binary
+
+# ---------------------------------------------------------------------------
+# 语言标注（影响 GitHub 的语言统计与 diff 高亮）
+# ---------------------------------------------------------------------------
+*.ts    linguist-language=TypeScript
+*.mjs   linguist-language=JavaScript
+*.js    linguist-language=JavaScript
+*.yml   linguist-language=YAML
+*.yaml  linguist-language=YAML
+
+# ---------------------------------------------------------------------------
+# 文档类：不做 diff（避免巨大的单行 YAML / JSON 把网页撑爆）
+# ---------------------------------------------------------------------------
+package-lock.json  -diff
+pnpm-lock.yaml     -diff
+
+# 这些文件在 GitHub 上不计入语言统计（都是生成物或配置）
+lib/**             linguist-generated
+node_modules/**    linguist-vendored

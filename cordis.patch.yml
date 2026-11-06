@@ -1,0 +1,10 @@
+# Cordis 补丁：把本插件插入 profile 插件树。
+#
+# `id` 是**稳定锚点** —— 别的补丁、设置项、日志行都用它引用本条目，
+# 因此它一旦发布就不该再改；`name` 必须与 `package.json` 的 `name` 逐字相同，
+# 否则宿主解析不到模块，启动时报
+#   "plugin tree failed to load: 1 entry did not activate"
+# 并静默禁用插件。
+- insert:
+    - id: magpie
+      name: 'dsh-magpie'
