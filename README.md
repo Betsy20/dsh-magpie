@@ -2,8 +2,14 @@
 
 把 [magpie](https://github.com/yetone/magpie) 本机模型网关接入 DeepSeek Harness 的插件。
 
-- **Provider**：`magpie` —— 网关上的全部模型自动出现在 DSH 的模型选择器里
+- **Provider**：`magpie-direct` —— 网关上的全部模型自动出现在 DSH 的模型选择器里
 - **面板**：侧边栏「Magpie」入口，iframe 嵌入 magpie 官方 Web UI
+
+> **为什么 id 是 `magpie-direct` 而不是 `magpie`**：DSH 桌面版内置了
+> `@deepseek-ai/dsh-llm-pi-ai`，它已经占用 provider id `magpie`，而且带一套自愈
+> 逻辑（只要配置里找不到启用的 `llm-pi-ai` 条目，宿主就会在几十秒内把整段配置
+> 追加回来）。同一个 provider id 只能挂一个 adapter —— 抢 `magpie` 会抛
+> `DUPLICATE_ADAPTER`，整个 profile 启动失败。所以本插件用独立 id 与它**并存**。
 
 ## 前置条件
 
@@ -216,7 +222,7 @@ plugin-src/client/
 
 ### provider 注册
 
-`ctx.llm.registerAdapter(['magpie'], adapter)` —— 内部已 `ctx.effect`，插件卸载时自动注销。**不要再包一层** `ctx.effect`，否则二次释放会抛 `REGISTRATION_DISPOSED`。
+`ctx.llm.registerAdapter(['magpie-direct'], adapter)` —— 内部已 `ctx.effect`，插件卸载时自动注销。**不要再包一层** `ctx.effect`，否则二次释放会抛 `REGISTRATION_DISPOSED`。
 
 ### 模型目录
 
@@ -336,6 +342,24 @@ PATH 里的 `D:\nodejs\node.exe`（v24.15.0）跑 vitest 会 `ERR_IPC_CHANNEL_CL
 - **`exports["./client"]` 必须存在**，否则宿主找不到客户端 bundle，面板静默不出现。
 - **包名改动要同时改 profile 的 `dependencies` 与 `dsh.profile.bundles`**，否则静默失效。
 - **本地 `link:` 安装不跑 `prepare`**，必须先手动 `node scripts/build.mjs`。
+
+### Windows 环境坑
+
+- **PowerShell 5.1 的 `Get-Content` 默认按 ANSI(GBK) 解码**。`~/.dsh/magpie/bin/version.json`
+  里的 `note` 字段是中文，`Get-Content -Raw | ConvertFrom-Json` 会把 UTF-8 的
+  `97 22` 两字节合成一个汉字，然后报「传入了未终止的字符串」——
+  **这是读取端的假故障，文件本身一直是对的**。读任何含中文的 UTF-8 文件都要显式
+  `-Encoding UTF8`（或 `[System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8)`）。
+- **`curl` 的 schannel 后端对 GitHub Release 重定向会静默截断**（`schannel: server
+  closed abruptly (missing close_notify)`，只下到 31–36 MB 就断，**退出码仍是 0**）。
+  所以 `src/download.ts` 用 Node 的 `fetch`（undici）而不是 `curl`。
+- **`cmd /c` 会吞掉批处理输出**（只回显 cmd banner），要用 `cmd //c`。
+- **`.cmd` 文件里只能写 ASCII**：cmd 按 GBK 读 UTF-8，中文会乱码成
+  `系统找不到指定的路径`。要传中文参数就直接在 Git Bash 里调 node。
+- **`wmic` 在 Windows 11 已移除**。查进程改用
+  `Get-Process -Name 'xxx'` 或 `Get-CimInstance Win32_Process`。
+  （注意：`Get-CimInstance -Filter "Name='a b.exe'"` 在 Git Bash 里多层引号转义会
+  报 `CimException HRESULT 0x80041017`，改用 `Where-Object` 更省事。）
 
 ## License
 
