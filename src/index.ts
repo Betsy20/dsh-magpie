@@ -444,19 +444,55 @@ export function apply(ctx: Context, config?: unknown): void {
     logger,
   })
 
-  // 原版 Web UI 的进程桥：**惰性**启动（第一次 `web.url` 才 spawn），
-  // 因此 DSH 启动时不会平白多一个 magpie 进程。
+  // 原版 Web UI 的进程桥：默认**惰性**启动（第一次 `web.url` 才 spawn），
+  // 因此不打开面板时不会平白多一个 magpie 进程。
   const bridge = new MagpieWebBridge({
     binary: options.magpieBinary,
     key: options.webKey,
     host: options.webHost,
     preferredPort: options.webPort,
+    gatewayURL: options.baseURL,
     logger,
   })
-  // 插件 fiber 卸载时杀子进程，否则 `magpie web` 会变成孤儿进程一直占端口。
+  // 插件 fiber 卸载时杀子进程，否则 `magpie serve` 会变成孤儿进程一直占端口。
   ctx.effect(() => () => {
     bridge.dispose()
   })
+
+  // 自动拉起网关。
+  //
+  // ## 为什么放在 `apply()` 而不是等面板打开
+  //
+  // 插件提供的是**模型**，不只是面板。用户打开 DSH 后第一件事往往是选模型
+  // 发消息 —— 如果网关要等面板打开才有，那第一次发消息就会 502。
+  //
+  // ## 为什么不 `await`
+  //
+  // `apply()` 是同步的，而且 cordis 会等它返回才认为插件激活完成。真要等
+  // `magpie serve` 就绪（冷启动实测 3–8 秒，插件多的时候十几秒）会拖慢
+  // DSH 启动，还可能触发 fiber 超时。所以这里**后台跑**：成功/失败都只写
+  // 日志，模型目录本身是惰性拉的，网关晚几秒就绪不影响正确性。
+  //
+  // ## 为什么失败不抛
+  //
+  // 网关起不来（二进制不在 PATH、端口全被占、被安全软件拦）不应该让整个
+  // 插件失效 —— 用户可能就是想连另一台机器上的网关。降级成一条 warn。
+  if (options.autoStartGateway) {
+    void bridge.ensure().then(
+      (handle) => {
+        logger.debug(
+          `${LOG_PREFIX} 网关已就绪：${options.baseURL}（Web UI 代理 ${handle.url}）`,
+        )
+      },
+      (error: unknown) => {
+        const detail = error instanceof Error ? error.message : String(error)
+        logger.warn(
+          `${LOG_PREFIX} 自动启动网关失败：${detail}；` +
+            `如果网关跑在别处，把 autoStartGateway 关掉即可`,
+        )
+      },
+    )
+  }
 
   // ⚠️ `registerAdapter` 内部已经 `ctx.effect(...)`，插件 fiber 卸载时自动注销，
   //    这里**不要**再包一层 effect（双层释放会让 handle 第二次调用抛

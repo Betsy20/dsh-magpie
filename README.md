@@ -7,14 +7,32 @@
 
 ## 前置条件
 
-magpie 网关必须已经在跑（本插件只做客户端，不负责启动网关）：
+只要 **`magpie` 在 `PATH` 里**（或用 `magpieBinary` 指定路径）。
 
-```bash
-magpie            # 或直接打开 magpie 桌面应用
-# 网关默认监听 127.0.0.1:3425
+网关由插件**自动拉起** —— 不需要事先手动开 magpie。插件加载时会起一个
+`magpie serve --web=<port>` 进程，它**同时**提供网关和 Web UI：
+
+```
+● magpie gateway on http://127.0.0.1:3425
+  OpenAI   http://127.0.0.1:3425/v1/chat/completions · …/v1/responses
+  Anthropic http://127.0.0.1:3425/v1/messages
+● magpie web on http://127.0.0.1:3480/?k=…
 ```
 
-验证：
+如果网关**已经在别的进程里跑**（比如你自己开着 magpie 桌面应用），`serve`
+检测到端口被占只提供 Web UI（日志里是 `another magpie serves the gateway
+there`），不会抢端口、也不会起第二个网关。
+
+不想让插件管进程（比如网关跑在另一台机器上），把 `autoStartGateway` 关掉：
+
+```yaml
+- id: magpie
+  config:
+    autoStartGateway: false
+    baseURL: http://192.168.1.10:3425
+```
+
+验证网关（插件启动后）：
 
 ```bash
 curl -s -H "Authorization: Bearer magpie" http://127.0.0.1:3425/v1/models
@@ -107,6 +125,7 @@ node node_modules/vitest/vitest.mjs run    # 63 个单测
 | `includeDisabledModels` | `true` | 是否包含「已在 Jet Hub 关闭」的模型 |
 | `sessionHeader` | `true` | 是否发送 `X-Magpie-Session` |
 | `webEnabled` | `true` | 是否嵌入原版 Web UI |
+| `autoStartGateway` | `true` | 插件加载时自动起 `magpie serve` 网关 |
 | `magpieBinary` | `magpie` | magpie 可执行文件路径 |
 | `webHost` | `127.0.0.1` | Web UI 监听地址 |
 | `webPort` | `3480` | Web UI 首选端口（占用时自动向后找空闲端口） |
@@ -123,7 +142,8 @@ src/
   sse.ts          SSE 流解析（跨 chunk 多字节安全 + 空闲超时 + abort）
   http.ts         HTTP 客户端（错误分类 / 重试 / attribution headers）
   admin.ts        管理 API（quotas / usage / limit / concurrency / routes）
-  web-bridge.ts   管理 magpie web 子进程 + 反向代理（登录取 cookie、注入转发、WS 透传）
+  gateway.ts      网关存活探测（/api/hello 轮询，避免把别人的 200 当成 magpie）
+  web-bridge.ts   管理 magpie serve 子进程 + 反向代理（登录取 cookie、注入转发、WS 透传）
   config.ts       schemastery 配置
   types.ts        magpie 线格式类型
   product.ts      常量
@@ -160,6 +180,33 @@ plugin-src/client/
 ```
 
 返回裸对象会被 `dsh-client-connection` 判为 `invalid server-response result`（界面上一堆看不懂的红条）。
+
+### 网关自动启动
+
+插件加载时（`apply()`）会在后台起一个 `magpie serve --web=<port>` 进程：
+
+```
+magpie serve --web=127.0.0.1:3480
+  ├── 网关 on http://127.0.0.1:3425        ← 模型走这里
+  └── Web UI on http://127.0.0.1:3480     ← 面板 iframe 走这里（再经反向代理）
+```
+
+**为什么是 `serve --web` 而不是 `web --addr`**：`magpie web` 要求**已经
+有**一个 magpie 在服务网关；`magpie serve --web=` 是**一个进程同时提供
+两者** —— 网关端口空闲时它自己服务，已被别的实例占用时它只提供 Web UI
+（日志里那句 `another magpie serves the gateway there`）。两种情况下都恰好
+是我们要的行为，不需要分支判断。
+
+**为什么不等它就绪**：`apply()` 是同步的，cordis 等它返回才认为插件激活
+完成。真等冷启动（实测 3–8 秒，插件多时十几秒）会拖慢 DSH 启动。所以后台
+跑，成功/失败只写日志 —— 模型目录本身是惰性拉的，网关晚几秒就绪不影响
+正确性。
+
+**失败不抛**：二进制不在 `PATH`、端口全被占、被安全软件拦，都不应该让整个
+插件失效（用户可能就是想连另一台机器上的网关）。降级成一条 `warn`。
+
+**卸载时清理**：`ctx.effect(() => () => bridge.dispose())` 里 `taskkill /T /F`
+连进程树一起收，否则 `magpie serve` 会变孤儿进程一直占端口。
 
 ### iframe 嵌入与反向代理
 

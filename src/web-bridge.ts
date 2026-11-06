@@ -74,6 +74,8 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { createServer as createHttpServer, request as httpRequest, type Server } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
 
+import { probeGateway } from './gateway.js'
+
 /**
  * stdout 里启动完成的标志行。
  *
@@ -152,6 +154,13 @@ export interface MagpieWebBridgeOptions {
   readonly preferredPort: number
   /** 启动超时（毫秒）。 */
   readonly startupTimeoutMs?: number
+  /**
+   * 网关根地址（如 `http://127.0.0.1:3425`）。
+   *
+   * 只用于启动前探测一次、把「网关在不在」写进日志 —— `magpie serve --web`
+   * 自己会处理端口占用，不依赖这个值。缺省时跳过探测。
+   */
+  readonly gatewayURL?: string
   /** 日志。 */
   readonly logger: WebBridgeLogger
 }
@@ -462,7 +471,7 @@ export class MagpieWebBridge {
   }
 
   /**
-   * 真正的启动流程：spawn → 等就绪 → 登录 → 起代理。
+   * 真正的启动流程：探测网关 → spawn `magpie serve --web` → 等就绪 → 登录 → 起代理。
    *
    * @returns 就绪句柄。
    */
@@ -479,11 +488,31 @@ export class MagpieWebBridge {
       )
     }
 
-    logger.debug(`[magpie] 启动 magpie web（${host}:${String(upstreamPort)}）`)
+    // 先看网关在不在。这不是「决定要不要启动」的开关（`magpie serve` 自己
+    // 会处理端口占用），而是**日志与诊断**：面板卡住时，用户能一眼看出
+    // 「网关早就跑着，卡的是 Web UI」还是「连网关都没起来」。
+    const gatewayURL = this.options.gatewayURL
+    if (gatewayURL !== undefined) {
+      const probe = await probeGateway(gatewayURL)
+      logger.debug(
+        probe.reachable
+          ? `[magpie] 网关已在线（${probe.version ?? '版本未知'}）：${gatewayURL}`
+          : `[magpie] 网关未运行，将由 magpie serve 一并启动：${gatewayURL}`,
+      )
+    }
 
+    logger.debug(`[magpie] 启动 magpie serve --web（${host}:${String(upstreamPort)}）`)
+
+    // 为什么用 `serve --web=` 而不是 `web --addr`：
+    // - `magpie web` 要求**已经有**一个 magpie 在服务网关，否则自己起一个
+    //   但退出时不保证网关还在（实测杀掉 web 进程后网关也断了）。
+    // - `magpie serve --web=` 是**一个进程同时提供网关 + Web UI**：
+    //   网关端口空闲时它自己服务；已被别的实例占用时它只提供 Web UI
+    //   （日志里那句 `another magpie serves the gateway there`）。
+    //   两种情况下都恰好是我们要的行为，不需要分支。
     const child = spawn(
       binary,
-      ['web', '--addr', `${host}:${String(upstreamPort)}`, '--no-open'],
+      ['serve', `--web=${host}:${String(upstreamPort)}`],
       {
         env: { ...process.env, MAGPIE_WEB_KEY: key },
         stdio: ['ignore', 'pipe', 'pipe'],

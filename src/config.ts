@@ -60,6 +60,18 @@ export interface MagpieOptions {
    * 关掉后只剩模型选择能力，没有一个可看的界面。
    */
   readonly webEnabled: boolean
+  /**
+   * 插件加载时是否自动拉起网关。
+   *
+   * 为什么需要这个：插件一开始假设「网关已经在跑」，但用户装完插件第一次
+   * 打开 DSH 时网关通常没起 —— 模型选择器是空的，面板一片红。让用户自己
+   * 去开 magpie 是没必要的摩擦。
+   *
+   * 打开后，`apply()` 会在后台起一个 `magpie serve --web=<port>` 进程
+   * （**一个进程同时提供网关和 Web UI**），插件卸载时连进程树一起收掉。
+   * 关掉则回到「只当客户端」——适合网关跑在另一台机器上的场景。
+   */
+  readonly autoStartGateway: boolean
   /** magpie 可执行文件路径或 PATH 里的名字。 */
   readonly magpieBinary: string
   /** 原版 Web UI 的监听地址。 */
@@ -100,6 +112,7 @@ export const DEFAULT_OPTIONS: MagpieOptions = Object.freeze({
   includeDisabledModels: true,
   sessionHeader: true,
   webEnabled: true,
+  autoStartGateway: true,
   magpieBinary: 'magpie',
   webHost: '127.0.0.1',
   webPort: 3480,
@@ -168,6 +181,11 @@ export const Config = Schema.object({
   webEnabled: Schema.boolean()
     .default(true)
     .description('面板里嵌入 magpie 原版 Web UI（magpie web），而不是自造页签')
+    .volatile(),
+
+  autoStartGateway: Schema.boolean()
+    .default(true)
+    .description('插件加载时自动起 magpie serve 网关；关掉则假定网关已在别处运行')
     .volatile(),
 
   magpieBinary: Schema.string()
@@ -241,6 +259,7 @@ export function resolveOptions(config: unknown): MagpieOptions {
     includeDisabledModels: boolean('includeDisabledModels', DEFAULT_OPTIONS.includeDisabledModels),
     sessionHeader: boolean('sessionHeader', DEFAULT_OPTIONS.sessionHeader),
     webEnabled: boolean('webEnabled', DEFAULT_OPTIONS.webEnabled),
+    autoStartGateway: boolean('autoStartGateway', DEFAULT_OPTIONS.autoStartGateway),
     magpieBinary: string('magpieBinary', DEFAULT_OPTIONS.magpieBinary),
     webHost: string('webHost', DEFAULT_OPTIONS.webHost),
     webPort: positiveNumber('webPort', DEFAULT_OPTIONS.webPort),
