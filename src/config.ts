@@ -72,6 +72,16 @@ export interface MagpieOptions {
    * 关掉则回到「只当客户端」——适合网关跑在另一台机器上的场景。
    */
   readonly autoStartGateway: boolean
+  /**
+   * 缺少 magpie 二进制时是否自动下载。
+   *
+   * 打开后，插件启动时会检查 `~/.dsh/magpie/bin/magpie[.exe]`，没有就
+   * 从 GitHub Releases 下 `magpie-cli-<os>-<arch>`（~69 MB）。
+   *
+   * 关掉则只做查找（配置 → 插件自带 → 系统安装 → PATH），全都没有就报错。
+   * 适合「公司网络挡了 GitHub」或「想自己管二进制」的场景。
+   */
+  readonly autoDownloadMagpie: boolean
   /** magpie 可执行文件路径或 PATH 里的名字。 */
   readonly magpieBinary: string
   /** 原版 Web UI 的监听地址。 */
@@ -113,6 +123,7 @@ export const DEFAULT_OPTIONS: MagpieOptions = Object.freeze({
   sessionHeader: true,
   webEnabled: true,
   autoStartGateway: true,
+  autoDownloadMagpie: true,
   magpieBinary: 'magpie',
   webHost: '127.0.0.1',
   webPort: 3480,
@@ -188,6 +199,11 @@ export const Config = Schema.object({
     .description('插件加载时自动起 magpie serve 网关；关掉则假定网关已在别处运行')
     .volatile(),
 
+  autoDownloadMagpie: Schema.boolean()
+    .default(true)
+    .description('缺少 magpie 二进制时自动从 GitHub 下载（~69 MB）；关掉则只用已找到的')
+    .volatile(),
+
   magpieBinary: Schema.string()
     .default('magpie')
     .description('magpie 可执行文件路径；留 magpie 表示用 PATH 里的那个')
@@ -260,6 +276,7 @@ export function resolveOptions(config: unknown): MagpieOptions {
     sessionHeader: boolean('sessionHeader', DEFAULT_OPTIONS.sessionHeader),
     webEnabled: boolean('webEnabled', DEFAULT_OPTIONS.webEnabled),
     autoStartGateway: boolean('autoStartGateway', DEFAULT_OPTIONS.autoStartGateway),
+    autoDownloadMagpie: boolean('autoDownloadMagpie', DEFAULT_OPTIONS.autoDownloadMagpie),
     magpieBinary: string('magpieBinary', DEFAULT_OPTIONS.magpieBinary),
     webHost: string('webHost', DEFAULT_OPTIONS.webHost),
     webPort: positiveNumber('webPort', DEFAULT_OPTIONS.webPort),

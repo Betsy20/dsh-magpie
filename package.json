@@ -55,7 +55,8 @@
     "build:client": "node scripts/build-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "prepare": "node scripts/build.mjs"
+    "prepare": "node scripts/build.mjs",
+    "magpie:download": "node scripts/fetch-magpie.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",

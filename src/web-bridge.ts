@@ -144,8 +144,17 @@ export interface WebBridgeLogger {
 
 /** 构造参数。 */
 export interface MagpieWebBridgeOptions {
-  /** magpie 可执行文件路径或 PATH 里的名字。 */
-  readonly binary: string
+  /**
+   * 解析好的 magpie 可执行文件绝对路径。
+   *
+   * 由 `src/binary.ts` 的 {@link resolveMagpieBinary} 产出的 —— 它会依次
+   * 找「配置指定 → 插件自带 → 系统安装 → PATH」。这里只接受**绝对路径**，
+   * 因为 `spawn` 的相对路径会按 `process.cwd()` 解析，而 DSH 的 cwd 不是
+   * 插件目录。
+   *
+   * `undefined` 表示一个都没找到；`start()` 会抛一条带安装指引的错误。
+   */
+  readonly binary: string | undefined
   /** 固定的 `MAGPIE_WEB_KEY`。 */
   readonly key: string
   /** 监听地址，默认 `127.0.0.1`。 */
@@ -478,6 +487,17 @@ export class MagpieWebBridge {
   private async start(): Promise<MagpieWebHandle> {
     const { binary, host, key, logger } = this.options
     const timeoutMs = this.options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS
+
+    // 二进制没找到就早点抛 —— 这里抛的错会出现在面板的红条上，比让
+    // `spawn` 抛一个 `ENOENT` 再往上包装可读得多。
+    if (binary === undefined) {
+      throw new Error(
+        '找不到 magpie 可执行文件。插件应该已经自动下载到 ~/.dsh/magpie/bin/ —— ' +
+          '如果下载失败，手动装一个 magpie（https://github.com/yetone/magpie/releases），' +
+          '或在设置里把 magpieBinary 指向它的绝对路径。',
+      )
+    }
+
     const upstreamPort = await findFreePort(host, this.options.preferredPort, DEFAULT_PORT_ATTEMPTS)
 
     // ⚠️ `MAGPIE_WEB_KEY` 必须 16+ 位、只含 [A-Za-z0-9._~-]，否则 magpie 会

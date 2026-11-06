@@ -61,6 +61,9 @@ function LoadingScreen() {
         'div',
         { className: 'dim-mp-loadingHint' },
         '首次打开需要拉取全部插件与账号，通常几秒到半分钟。之后会走缓存，秒开。',
+        h('br'),
+        h('br'),
+        '如果这是第一次运行插件，宿主可能正在下载 magpie 二进制（约 69 MB），需要几分钟。',
       ),
     ),
   )

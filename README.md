@@ -7,9 +7,64 @@
 
 ## 前置条件
 
-只要 **`magpie` 在 `PATH` 里**（或用 `magpieBinary` 指定路径）。
+**没有前置条件 —— 装上就能用。**
 
-网关由插件**自动拉起** —— 不需要事先手动开 magpie。插件加载时会起一个
+插件会在第一次需要时自动把 magpie 二进制下到 `~/.dsh/magpie/bin/`：
+
+```
+[magpie] 未找到 magpie 二进制，自动下载中（首次约 69 MB）…
+[magpie] 下载 magpie-cli-windows-amd64.exe（v0.1.3189）
+[magpie] 下载中 17.3 MB / 69.5 MB（25%）
+[magpie] 下载完成：C:\Users\你\.dsh\magpie\bin\magpie.exe（69.5 MB，sha256 3f2a…）
+[magpie] 网关已就绪：http://127.0.0.1:3425（Web UI 代理 http://127.0.0.1:64808/）
+```
+
+### 二进制从哪来（四级回退）
+
+插件按这个顺序找，**命中即停**：
+
+| 顺序 | 位置 | 说明 |
+| --- | --- | --- |
+| 1 | 配置里的 `magpieBinary` | 显式指定绝对路径，优先级最高 |
+| 2 | `~/.dsh/magpie/bin/magpie[.exe]` | 插件自己下的，跨 profile 共享 |
+| 3 | 系统安装位置 | Windows `%LOCALAPPDATA%\Programs\magpie\`、macOS `/Applications/magpie.app/…`、Linux `~/.local/bin` 等 |
+| 4 | `PATH` | 逐目录找 |
+
+四级都没有、且 `autoDownloadMagpie: true`（默认），才走下载。
+
+**为什么要自己下一份**：magpie 的桌面安装包**不会**把自己加进 `PATH`，
+所以「用户装了 magpie 桌面版」和「插件能在 `spawn` 里找到它」是两件事。
+第 3 级的系统安装位置就是为这个准备的 —— 你在 PATH 外装了 magpie，插件也能用上；
+连装都没装才去下载。
+
+### 关掉自动下载
+
+公司网络挡了 GitHub、或者想自己管二进制：
+
+```yaml
+- id: magpie
+  config:
+    autoDownloadMagpie: false
+    magpieBinary: /opt/magpie/magpie    # 指向已有的
+```
+
+### 预先下载（可选）
+
+插件在第一次需要时会自动下，正常情况下不用管。想在 CI 镜像里预置、
+或者先确认网络通不通：
+
+```bash
+npm run magpie:download            # 没有才下
+npm run magpie:download -- --force # 强制重下
+```
+
+下载目标固定是 `~/.dsh/magpie/bin/magpie[.exe]`，跟插件运行时用的是**同一套
+代码**（`src/download.ts` 的 `ensureMagpieBinary`），所以手动跑和自动跑结果
+必然一致。想离线部署就把整个 `~/.dsh/magpie/` 目录打包带走。
+
+### 网关由插件自动拉起
+
+不需要事先手动开 magpie。插件加载时会起一个
 `magpie serve --web=<port>` 进程，它**同时**提供网关和 Web UI：
 
 ```
@@ -126,7 +181,8 @@ node node_modules/vitest/vitest.mjs run    # 63 个单测
 | `sessionHeader` | `true` | 是否发送 `X-Magpie-Session` |
 | `webEnabled` | `true` | 是否嵌入原版 Web UI |
 | `autoStartGateway` | `true` | 插件加载时自动起 `magpie serve` 网关 |
-| `magpieBinary` | `magpie` | magpie 可执行文件路径 |
+| `autoDownloadMagpie` | `true` | 找不到 magpie 二进制时自动从 GitHub 下载（~69 MB） |
+| `magpieBinary` | `magpie` | magpie 可执行文件路径（绝对路径优先） |
 | `webHost` | `127.0.0.1` | Web UI 监听地址 |
 | `webPort` | `3480` | Web UI 首选端口（占用时自动向后找空闲端口） |
 | `webKey` | *(内置随机串)* | `MAGPIE_WEB_KEY`，需 16+ 字符 |
@@ -143,6 +199,8 @@ src/
   http.ts         HTTP 客户端（错误分类 / 重试 / attribution headers）
   admin.ts        管理 API（quotas / usage / limit / concurrency / routes）
   gateway.ts      网关存活探测（/api/hello 轮询，避免把别人的 200 当成 magpie）
+  binary.ts       magpie 二进制解析（配置 → 插件自带 → 系统安装 → PATH）
+  download.ts     自动下载（GitHub Releases，`.part` + rename + sha256）
   web-bridge.ts   管理 magpie serve 子进程 + 反向代理（登录取 cookie、注入转发、WS 透传）
   config.ts       schemastery 配置
   types.ts        magpie 线格式类型

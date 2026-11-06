@@ -46,6 +46,8 @@ import { MagpieAdapter } from './adapter.js'
 import { ModelCatalog } from './catalog.js'
 import { MagpieAdminClient, toSnapshotModel, type SnapshotModel } from './admin.js'
 import { resolveApiKey, resolveOptions, type MagpieOptions } from './config.js'
+import { describeSource, resolveMagpieBinary } from './binary.js'
+import { ensureMagpieBinary } from './download.js'
 import { LOG_PREFIX, PROVIDER } from './product.js'
 import type { RequestContext } from './http.js'
 import { MagpieWebBridge } from './web-bridge.js'
@@ -252,7 +254,14 @@ function registerPanelRpc(
   catalog: ModelCatalog,
   options: MagpieOptions,
   logger: { debug(message: string): void; warn(message: string): void },
-  bridge: MagpieWebBridge,
+  /**
+   * 惰性取的 Web 桥。
+   *
+   * 为什么是函数而不是实例：二进制解析可能要**下载**（首次 ~69 MB），
+   * 而 `apply()` 必须同步返回。所以桥在第一次真正需要时才创建，
+   * 这里只拿到一个「取桥」的函数。
+   */
+  getBridge: () => Promise<MagpieWebBridge>,
 ): void {
   const connection = (ctx as unknown as { connection?: { fetch?: { register?: unknown } } })
     .connection
@@ -321,7 +330,7 @@ function registerPanelRpc(
           }
         }
         try {
-          const handle = await bridge.ensure()
+          const handle = await (await getBridge()).ensure()
           return { ok: true, value: { url: handle.url, port: handle.port } }
         } catch (error) {
           return {
@@ -446,17 +455,61 @@ export function apply(ctx: Context, config?: unknown): void {
 
   // 原版 Web UI 的进程桥：默认**惰性**启动（第一次 `web.url` 才 spawn），
   // 因此不打开面板时不会平白多一个 magpie 进程。
-  const bridge = new MagpieWebBridge({
-    binary: options.magpieBinary,
-    key: options.webKey,
-    host: options.webHost,
-    preferredPort: options.webPort,
-    gatewayURL: options.baseURL,
-    logger,
-  })
+  //
+  // 二进制解析是异步的（可能要下载 69 MB），而 `apply()` 必须同步返回 ——
+  // 所以这里只建一个「取桥」的闭包，真正的桥在第一次 `await` 时才创建。
+  let bridgePromise: Promise<MagpieWebBridge> | undefined
+  let bridgeInstance: MagpieWebBridge | undefined
+
+  /**
+   * 取（并首次创建）Web 桥。
+   *
+   * 解析顺序：配置里的绝对路径 → `~/.dsh/magpie/bin/` → 系统安装位置 → PATH；
+   * 一个都没有且 `autoDownloadMagpie` 开着，就从 GitHub 下。
+   */
+  const getBridge = async (): Promise<MagpieWebBridge> => {
+    if (bridgePromise !== undefined) return bridgePromise
+    bridgePromise = (async (): Promise<MagpieWebBridge> => {
+      let binary = await resolveMagpieBinary(options.magpieBinary)
+
+      if (binary === undefined && options.autoDownloadMagpie) {
+        logger.debug(`${LOG_PREFIX} 未找到 magpie 二进制，自动下载中（首次约 69 MB）…`)
+        try {
+          await ensureMagpieBinary({ logger })
+          binary = await resolveMagpieBinary(options.magpieBinary)
+        } catch (error) {
+          // 下载失败不算致命：用户可能就想连另一台机器上的网关。
+          logger.warn(
+            `${LOG_PREFIX} 自动下载 magpie 失败：${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+      }
+
+      if (binary !== undefined) {
+        logger.debug(
+          `${LOG_PREFIX} 使用 magpie 二进制：${binary.path}（${describeSource(binary.source)}）`,
+        )
+      }
+
+      const bridge = new MagpieWebBridge({
+        binary: binary?.path,
+        key: options.webKey,
+        host: options.webHost,
+        preferredPort: options.webPort,
+        gatewayURL: options.baseURL,
+        logger,
+      })
+      bridgeInstance = bridge
+      return bridge
+    })()
+    return bridgePromise
+  }
+
   // 插件 fiber 卸载时杀子进程，否则 `magpie serve` 会变成孤儿进程一直占端口。
+  // ⚠️ 这里用 `bridgeInstance` 而不是 `bridgePromise` —— 卸载是同步的，
+  //    不能 `await`；如果桥还没建出来，就没什么可关的。
   ctx.effect(() => () => {
-    bridge.dispose()
+    bridgeInstance?.dispose()
   })
 
   // 自动拉起网关。
@@ -478,18 +531,25 @@ export function apply(ctx: Context, config?: unknown): void {
   // 网关起不来（二进制不在 PATH、端口全被占、被安全软件拦）不应该让整个
   // 插件失效 —— 用户可能就是想连另一台机器上的网关。降级成一条 warn。
   if (options.autoStartGateway) {
-    void bridge.ensure().then(
-      (handle) => {
-        logger.debug(
-          `${LOG_PREFIX} 网关已就绪：${options.baseURL}（Web UI 代理 ${handle.url}）`,
-        )
-      },
+    void getBridge().then(
+      (bridge) =>
+        bridge.ensure().then(
+          (handle) => {
+            logger.debug(
+              `${LOG_PREFIX} 网关已就绪：${options.baseURL}（Web UI 代理 ${handle.url}）`,
+            )
+          },
+          (error: unknown) => {
+            const detail = error instanceof Error ? error.message : String(error)
+            logger.warn(
+              `${LOG_PREFIX} 自动启动网关失败：${detail}；` +
+                `如果网关跑在别处，把 autoStartGateway 关掉即可`,
+            )
+          },
+        ),
       (error: unknown) => {
         const detail = error instanceof Error ? error.message : String(error)
-        logger.warn(
-          `${LOG_PREFIX} 自动启动网关失败：${detail}；` +
-            `如果网关跑在别处，把 autoStartGateway 关掉即可`,
-        )
+        logger.warn(`${LOG_PREFIX} 准备 magpie 二进制失败：${detail}`)
       },
     )
   }
@@ -502,6 +562,6 @@ export function apply(ctx: Context, config?: unknown): void {
 
   // 面板通道：只有 Web profile 里才存在 connection，其余 profile 安静跳过。
   ctx.inject(['connection'], (connectionCtx) => {
-    registerPanelRpc(connectionCtx as Context, catalog, options, logger, bridge)
+    registerPanelRpc(connectionCtx as Context, catalog, options, logger, getBridge)
   })
 }
