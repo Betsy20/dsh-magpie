@@ -1,0 +1,81 @@
+# ============================================================================
+# CI：类型检查 + 单测
+# ============================================================================
+# 为什么只跑这两件：它们是**纯本地、零外部依赖**的检查 —— 不需要 magpie 网关，
+# 不需要 DSH 宿主。任何需要真实网关才能跑的验证（`scripts/smoke.mjs`）留给
+# 开发者手动跑，否则 CI 会变成一个需要维护密钥的定时炸弹。
+# ============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一个分支上新的推送取消旧的运行，省 CI 额度。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # 22 是最低支持版本，24 是 DSH 自带运行时的版本。
+        # 两者都测，因为 engines 里写的就是这个区间。
+        node: [22, 24]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # `prepare` 脚本会在 install 末尾跑一次完整构建（tsc + esbuild），
+      # 所以这一步之后 `lib/` 就存在了，不需要额外 build 步骤。
+      - name: Install
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # 构建产物是「能加载」的最低保证 —— 单测只测模块逻辑，
+      # 不测 esbuild 的包裹格式与注册 id。
+      - name: Verify build artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f lib/index.js          || { echo "缺少 lib/index.js";   exit 1; }
+          test -f lib/client.js         || { echo "缺少 lib/client.js";  exit 1; }
+          # 插件必须导出 name / inject / apply，缺一个宿主就静默禁用
+          node -e "
+            const m = require('./lib/index.js');
+            const need = ['name', 'inject', 'apply', 'Config'];
+            const missing = need.filter((k) => m[k] === undefined);
+            if (missing.length > 0) { console.error('缺少导出:', missing); process.exit(1); }
+            if (m.name !== 'magpie') { console.error('name 应为 magpie，实际', m.name); process.exit(1); }
+            console.log('导出 OK:', need.join(', '));
+          " 2>/dev/null || node --input-type=module -e "
+            import * as m from './lib/index.js';
+            const need = ['name', 'inject', 'apply', 'Config'];
+            const missing = need.filter((k) => m[k] === undefined);
+            if (missing.length > 0) { console.error('缺少导出:', missing); process.exit(1); }
+            if (m.name !== 'magpie') { console.error('name 应为 magpie，实际', m.name); process.exit(1); }
+            console.log('导出 OK:', need.join(', '));
+          "
+          # 客户端 bundle 的注册 id 必须等于包名，否则启动报 N entry did not activate
+          grep -q 'id: "dsh-magpie"' lib/client.js || { echo "客户端注册 id 不是 dsh-magpie"; exit 1; }
+          echo "构建产物校验 OK"

@@ -23,14 +23,22 @@ curl -s -H "Authorization: Bearer magpie" http://127.0.0.1:3425/v1/models
 ## 安装
 
 ```bash
-# 1. 构建
-node scripts/build.mjs
+# 1. 克隆
+git clone https://github.com/Betsy20/dsh-magpie.git
+cd dsh-magpie
 
-# 2. 装进 profile（把 <profile> 换成 desktop / web）
-dsh plugin --profile <profile> install C:/Users/Betsy/.dsh/plugin-src/dsh-magpie
+# 2. 装依赖（`prepare` 脚本会自动跑一次构建）
+npm install
 
-# 3. 重启 DSH
+# 3. 装进 profile（把 <profile> 换成 desktop / web）
+dsh plugin --profile <profile> install "$(pwd)"
+
+# 4. 重启 DSH
 ```
+
+> **`link:` 安装不会跑 `prepare`。** 如果第 2 步跳过了（比如直接 `dsh plugin
+> install` 一个没装过依赖的目录），必须先手动 `node scripts/build.mjs`，
+> 否则 `lib/index.js` 不存在，宿主会静默禁用插件。
 
 `package.json` 的 `dsh.bundle.patch` 会指向 `cordis.patch.yml`，它往插件树里插一条：
 
@@ -39,6 +47,48 @@ dsh plugin --profile <profile> install C:/Users/Betsy/.dsh/plugin-src/dsh-magpie
     - id: magpie
       name: 'dsh-magpie'
 ```
+
+## 仓库里有什么
+
+**只放源码。** 任何「一条命令就能重新生成」的东西都不进版本库 —— 它们只会
+让 diff 变吵、让 review 变瞎、让冲突变多。
+
+### ✅ 会提交
+
+| 路径 | 说明 |
+| --- | --- |
+| `src/**/*.ts` | 宿主侧 TypeScript 源码 |
+| `plugin-src/client/**/*.js` | 客户端面板源码（esbuild 的输入） |
+| `scripts/**/*.mjs` `scripts/**/*.ps1` | 构建 / 冒烟 / 装配校验 / 链接脚本 |
+| `tests/**/*.spec.ts` | vitest 单测 |
+| `package.json` `tsconfig.json` `vitest.config.ts` | 工程配置 |
+| `cordis.patch.yml` | 插件树补丁（`dsh.bundle.patch` 指向它） |
+| `README.md` `LICENSE` `.gitignore` `.gitattributes` | 文档与仓库规范 |
+
+### ❌ 不提交（已在 `.gitignore` 里）
+
+| 路径 | 为什么 |
+| --- | --- |
+| `lib/` | `node scripts/build.mjs` 的产物（tsc → 宿主侧，esbuild → `lib/client.js`）。提交它等于每次改源码都要手工同步一份编译结果，diff 里全是噪声 |
+| `node_modules/` | `npm install` 重新生成 |
+| `.env` `.env.*` | **含真实 key**（`MAGPIE_GATEWAY_KEY` / `MAGPIE_WEB_KEY`），泄露即等于把网关交给别人 |
+| `*.log` `logs/` | 运行期日志，可能含 token / cookie / 本机绝对路径 |
+| `*.tsbuildinfo` `dist/` `build/` `coverage/` | 构建缓存与测试产物 |
+| `.vscode/*` `.idea/` | 个人 IDE 配置 |
+| `.DS_Store` `Thumbs.db` `desktop.ini` | 操作系统垃圾文件 |
+| `*.png`（`docs/screenshots/` 除外） | 调试期截图，体积大且无复用价值 |
+| `*.tmp` `*.bak` `*.orig` `scratch/` `tmp/` | 临时文件 |
+
+### 从仓库到能跑
+
+```bash
+git clone https://github.com/Betsy20/dsh-magpie.git && cd dsh-magpie
+npm install          # 触发 prepare → 生成 lib/
+node node_modules/vitest/vitest.mjs run    # 63 个单测
+```
+
+`lib/` 是**生成物**，不在仓库里 —— 这是刻意为之，保证「仓库里看到的」与
+「实际跑的」永远一一对应。
 
 ## 配置
 
