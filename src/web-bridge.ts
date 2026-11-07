@@ -124,10 +124,39 @@ const DROPPED_REQUEST_HEADERS = new Set([
  * gzip/br 压缩的，丢了 `content-encoding` 浏览器就不知道要解压，页面会显示成
  * 一堆乱码；丢了 `content-length` 则退化成 chunked，虽然能用但多一层开销。
  * 代理不修改响应体，所以这两个头原样透传是安全的。
+ *
+ * ## ⚠️⚠️ 必须剥离 `content-security-policy` / `x-frame-options`
+ *
+ * magpie web 会发 `Content-Security-Policy: frame-ancestors 'self'`（外加
+ * `X-Frame-Options: SAMEORIGIN` 一类的老写法）。这条策略对 magpie 自己
+ * 的同源 iframe 是保护，但**我们的代理本身就是跨源**：
+ *
+ * ```
+ * 宿主页面  dsh-app://app/          ← Electron 的 app 协议
+ * iframe    http://127.0.0.1:65436/  ← 我们的代理随机端口
+ * ```
+ *
+ * `frame-ancestors 'self'` 只允许 magpie 自己的源（`127.0.0.1:3480`）嵌入，
+ * 于是浏览器直接**拒绝**我们的 iframe，控制台报：
+ *
+ * ```
+ * Framing 'http://127.0.0.1:65436/' violates the following Content Security
+ * Policy directive: "frame-ancestors 'self'". The request has been blocked.
+ * ```
+ *
+ * 宿主的 `plugin-pages` 拿不到 iframe 的 `load` 事件，超时后报
+ * 「Jet Hub 的页面没有响应」。
+ *
+ * **安全性说明**：代理只监听回环（见 `connectHost()`），能访问它的只有本机；
+ * 而 magpie 自己的登录 cookie 由代理**服务端注入**（见 `set-cookie` 的说明），
+ * 浏览器侧本来就没有凭据可被跨源读取。所以剥离这两个头不会降低实际安全性 ——
+ * 它们的「保护」在这个部署形态下本来就不成立。
  */
 const DROPPED_RESPONSE_HEADERS = new Set([
   'set-cookie',
   'connection',
+  'content-security-policy',
+  'content-security-policy-report-only',
   'keep-alive',
   'proxy-authenticate',
   'proxy-authorization',
@@ -135,6 +164,7 @@ const DROPPED_RESPONSE_HEADERS = new Set([
   'trailer',
   'transfer-encoding',
   'upgrade',
+  'x-frame-options',
 ])
 
 /**
