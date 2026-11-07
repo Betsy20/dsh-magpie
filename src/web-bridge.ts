@@ -224,7 +224,11 @@ const INJECTED_HTML_SCRIPT = `<script>
     var prefix = "/api/window/";
     var at = url.indexOf(prefix);
     if (at < 0) {
-      return originalFetch.apply(this, arguments);
+      // 用 window 而不是 this —— 如果调用方是 const f = fetch; f(...)，
+      // this 就是 undefined，originalFetch.apply(undefined, ...) 在严格
+      // 模式下会抛 TypeError。api() 里是直接调用所以没事，但 hook 层
+      // 不能假设调用方怎么写。
+      return originalFetch.apply(window, arguments);
     }
     var rest = url.slice(at + prefix.length);
     var q = rest.indexOf("?");

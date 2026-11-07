@@ -323,9 +323,17 @@ function showMagpiePage(view, signal) {
     // 用它；小窗的是 `.dim-mp-dockFrame`，不会误伤。
     const frame = document.querySelector('iframe.dim-mp-frame')
     const target = frame?.contentWindow
-    if (target !== null && target !== undefined) {
+    if (target !== null && target !== undefined && typeof frame.src === 'string') {
+      // ⚠️ 用 iframe 自己的 origin 而不是 `"*"` —— `"*"` 等于「任何窗口
+      //    都能收」，虽然我们发的是无害的切页指令，但没有理由广播出去。
+      let origin = null
       try {
-        target.postMessage({ source: 'dsh-magpie-host', kind: 'show', view }, '*')
+        origin = new URL(frame.src).origin
+      } catch {
+        // `frame.src` 不是合法 URL —— 下面退化成 `"*"`。
+      }
+      try {
+        target.postMessage({ source: 'dsh-magpie-host', kind: 'show', view }, origin ?? '*')
         return
       } catch {
         // 跨源时可能抛 —— 继续重试没有意义，交给下一轮。
