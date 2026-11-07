@@ -128,13 +128,31 @@ export function apply(ctx) {
   // 样式注入幂等，放在最前面 —— 即使后面某处注册失败，面板至少样式是对的。
   installMagpieStyles()
 
+  /**
+   * 稳定的 RPC 调用器 —— **只创建一次**，所有槽位共用同一个引用。
+   *
+   * ## ⚠️ 为什么不能在 `inject` 里 `makeRpcCall(ctx)`
+   *
+   * `MagpiePanel` 的加载 effect 依赖 `[rpcCall, reloadToken]`。如果在
+   * `inject` 回调里现造，每次渲染都是新的函数引用 ⇒ effect 重新执行 ⇒
+   * 状态被设回 `loading` ⇒ 再发请求 ⇒ 无限加载循环。官方插件
+   * （`dsh-providers-hub`）也是把 `rpcCall` 提在外面只建一次。
+   *
+   * ## 那 `ctx.connection` 变了怎么办
+   *
+   * `makeRpcCall` 返回的箭头函数**内部每次重新取** `ctx.connection`
+   * （见它的文档注释）—— 连接服务被替换（profile 切换、重连）时会自动
+   * 用新的，不需要重建这个函数。
+   */
+  const rpcCall = makeRpcCall(ctx)
+
   // ── 入口一：中央主面板的渲染体（无条件） ──
   ctx.slots.inject('main', () =>
     ctx.slots.register(
       {
         name: 'main',
         key: PANEL_KEY,
-        inject: () => ({ rpcCall: makeRpcCall(ctx) }),
+        inject: () => ({ rpcCall }),
       },
       MagpiePanelForMain,
     ),
@@ -161,7 +179,7 @@ export function apply(ctx) {
         id: PANEL_KEY,
         order: SETTINGS_ORDER,
         label: () => 'Magpie',
-        inject: () => ({ rpcCall: makeRpcCall(ctx) }),
+        inject: () => ({ rpcCall }),
       },
       MagpiePanelForSettings,
     ),
@@ -178,7 +196,7 @@ export function apply(ctx) {
         name: 'conversation.composer.dock',
         id: PANEL_KEY,
         order: DOCK_ORDER,
-        inject: () => ({ rpcCall: makeRpcCall(ctx) }),
+        inject: () => ({ rpcCall }),
       },
       MagpieDockButtonForDock,
     ),

@@ -330,6 +330,24 @@ export function apply(ctx: Context, config?: unknown): void {
   const lifecycle = new AbortController()
 
   /**
+   * 每个 `await` 之后重新确认插件还活着。
+   *
+   * ## ⚠️ 为什么必须有
+   *
+   * 卸载是**同步**的（`ctx.effect` 的清理函数），但 `getBridge()` 里有多次
+   * `await`（解析二进制、下载 69 MB、两次解析）—— 卸载可能发生在任意两次
+   * 之间。不检查的话：`bridgeInstance` 那时还是 `undefined`，清理函数
+   * 什么也没关；随后异步流程继续 `new MagpieWebBridge(...)`，`autoStartGateway`
+   * 的 `.then` 再去 `ensure()` spawn `magpie serve` —— **插件已卸载，
+   * magpie 子进程和 HTTP 代理仍在跑**。
+   */
+  const assertAlive = (): void => {
+    if (lifecycle.signal.aborted) {
+      throw new Error('插件已卸载')
+    }
+  }
+
+  /**
    * 取（并首次创建）Web 桥。
    *
    * 解析顺序：配置里的绝对路径 → `~/.dsh/magpie/bin/` → 系统安装位置 → PATH；
@@ -338,13 +356,16 @@ export function apply(ctx: Context, config?: unknown): void {
   const getBridge = async (): Promise<MagpieWebBridge> => {
     if (bridgePromise !== undefined) return bridgePromise
     bridgePromise = (async (): Promise<MagpieWebBridge> => {
+      assertAlive()
       let binary = await resolveMagpieBinary(options.magpieBinary)
+      assertAlive()
 
       if (binary === undefined && options.autoDownloadMagpie) {
         logger.debug(`${LOG_PREFIX} 未找到 magpie 二进制，自动下载中（首次约 69 MB）…`)
         try {
           await ensureMagpieBinary({ logger, signal: lifecycle.signal })
           binary = await resolveMagpieBinary(options.magpieBinary)
+          assertAlive()
         } catch (error) {
           // 卸载打断的不算「下载失败」—— 直接抛出去，别刷 warn。
           if (lifecycle.signal.aborted) {
@@ -363,6 +384,7 @@ export function apply(ctx: Context, config?: unknown): void {
         )
       }
 
+      assertAlive()
       const bridge = new MagpieWebBridge({
         binary: binary?.path,
         key: options.webKey,
@@ -372,6 +394,12 @@ export function apply(ctx: Context, config?: unknown): void {
         logger,
       })
       bridgeInstance = bridge
+      // 构造是同步的，但两次 `await` 之间卸载可能已经发生 —— 立刻关掉，
+      // 别让 `autoStartGateway` 拿着它去 spawn。
+      if (lifecycle.signal.aborted) {
+        bridge.dispose()
+        throw new Error('插件已卸载')
+      }
       return bridge
     })().catch((error: unknown) => {
       // ⚠️ 失败的 Promise 不能留在缓存里 —— 否则后续每次 `web.url` 都拿到
@@ -413,8 +441,13 @@ export function apply(ctx: Context, config?: unknown): void {
   // 插件失效 —— 用户可能就是想连另一台机器上的网关。降级成一条 warn。
   if (options.autoStartGateway) {
     void getBridge().then(
-      (bridge) =>
-        bridge.ensure().then(
+      (bridge) => {
+        // 桥 resolve 之后、`ensure()` 之前可能已经卸载了 —— 这时再去
+        // spawn 就是孤儿进程。
+        if (lifecycle.signal.aborted) {
+          return
+        }
+        return bridge.ensure().then(
           (handle) => {
             logger.debug(
               `${LOG_PREFIX} 网关已就绪：${options.baseURL}（Web UI 代理 ${handle.url}）`,
@@ -427,7 +460,8 @@ export function apply(ctx: Context, config?: unknown): void {
                 `如果网关跑在别处，把 autoStartGateway 关掉即可`,
             )
           },
-        ),
+        )
+      },
       (error: unknown) => {
         const detail = error instanceof Error ? error.message : String(error)
         logger.warn(`${LOG_PREFIX} 准备 magpie 二进制失败：${detail}`)

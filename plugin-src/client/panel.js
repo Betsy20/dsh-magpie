@@ -311,9 +311,13 @@ export function MagpieDockButton({ rpcCall }) {
  *
  * @param view - magpie 的页面 id（`agents` / `usage` / `routing` / `settings` …）。
  */
-function showMagpiePage(view) {
+function showMagpiePage(view, signal) {
   let tries = 0
   const tick = () => {
+    // 小窗已经关了 —— 别再往一个卸载掉的 iframe 发消息。
+    if (signal?.aborted === true) {
+      return
+    }
     tries += 1
     // `.dim-mp-frame` 是 MagpiePanel 的 iframe —— 只有侧边栏的完整页面
     // 用它；小窗的是 `.dim-mp-dockFrame`，不会误伤。
@@ -338,6 +342,21 @@ function showMagpiePage(view) {
 }
 
 function MagpieDockWindow({ url, onClose }) {
+  const frameRef = React.useRef(null)
+  /**
+   * iframe 自己的源 —— 用来校验 `postMessage` 是不是它抛来的。
+   *
+   * ⚠️ iframe（代理端口）和宿主（DSH 端口）**不同源**，所以 `event.origin`
+   * 一定和 `location.origin` 不一样，必须从 `url` 现算。
+   */
+  const frameOrigin = React.useMemo(() => {
+    try {
+      return new URL(url).origin
+    } catch {
+      return null
+    }
+  }, [url])
+
   // 代理注入了脚本（`src/web-bridge.ts` 的 INJECTED_HTML_SCRIPT），它把
   // `api("window/...")` 这类 **Wails 桌面 RPC** 全部转成这里的消息。
   //
@@ -355,7 +374,17 @@ function MagpieDockWindow({ url, onClose }) {
   //   带了 `view` 就再切到那一页；
   // - `window/quit` = 关闭小窗。
   React.useEffect(() => {
+    // 卸载时中断切页轮询 —— 否则小窗关了还在往旧 iframe 发消息。
+    const controller = new AbortController()
     const onMessage = (event) => {
+      // ⚠️ 必须校验来源 —— 任何能往本窗口 `postMessage` 的页面都能伪造
+      //    `quit`（关小窗）或 `main`（跳转）。只认自己那个 iframe。
+      if (frameRef.current !== null && event.source !== frameRef.current.contentWindow) {
+        return
+      }
+      if (frameOrigin !== null && event.origin !== frameOrigin) {
+        return
+      }
       const data = event.data
       if (data === null || typeof data !== 'object' || data.source !== 'dsh-magpie') {
         return
@@ -379,14 +408,15 @@ function MagpieDockWindow({ url, onClose }) {
       if (view.length > 0) {
         // 完整页面挂载后才切页 —— 刚点完侧边栏时 iframe 可能还在加载，
         // 直接 postMessage 会丢。轮询几次，拿到就停。
-        showMagpiePage(view)
+        showMagpiePage(view, controller.signal)
       }
     }
     window.addEventListener('message', onMessage)
     return () => {
+      controller.abort()
       window.removeEventListener('message', onMessage)
     }
-  }, [onClose])
+  }, [frameOrigin, onClose])
 
   return h(
     'div',
@@ -403,6 +433,7 @@ function MagpieDockWindow({ url, onClose }) {
         'aria-label': 'Magpie 小窗',
       },
       h('iframe', {
+        ref: frameRef,
         className: 'dim-mp-dockFrame',
         src: url,
         title: 'Magpie 小窗',

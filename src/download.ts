@@ -32,7 +32,7 @@
  * @module dsh-magpie/download
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
 import { chmod, mkdir, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -272,7 +272,11 @@ export async function ensureMagpieBinary(
   logger.debug(`[magpie]   ${asset.url}`)
 
   await mkdir(dirname(destination), { recursive: true })
-  const partPath = `${destination}.part`
+  // ⚠️ 临时文件名必须**唯一** —— 固定 `${destination}.part` 会让两个并发
+  //    的 `ensureMagpieBinary()` 互相写/删同一个文件，最后得到一个损坏的
+  //    二进制（长度够、内容是两段拼起来的）。PID + UUID 保证每次下载都有
+  //    独立的中转文件。
+  const partPath = `${destination}.${String(process.pid)}.${randomUUID()}.part`
   let downloaded: { bytes: number; sha256: string }
   try {
     const response = await fetch(asset.url, {
@@ -302,18 +306,39 @@ export async function ensureMagpieBinary(
     )
   }
 
+  // ⚠️ 不能「先 `rm(destination)` 再 `rename`」—— 删完到 rename 之间进程
+  //    崩溃就同时丢了旧二进制和新下载的文件，用户必须重新下 69 MB。改成
+  //    「先备份、再替换、失败回滚」：目标存在时挪成 `.bak`，成功后删掉；
+  //    替换失败就把 `.bak` 放回去。
+  //
+  //    Windows 上 `rename` 到**已存在**的目标会抛 `EEXIST`（POSIX 是静默
+  //    覆盖），备份正好一并解决这个问题。
+  const backupPath = `${destination}.${String(process.pid)}.${randomUUID()}.bak`
+  let backupMade = false
   try {
-    // Windows 上 `rename` 到**已存在**的目标会抛 `EEXIST`（POSIX 是静默
-    // 覆盖）。强制重下时先删旧的，否则用户永远卡在「下载完成但没生效」。
-    await rm(destination, { force: true })
+    await rename(destination, backupPath)
+    backupMade = true
+  } catch {
+    // 目标不存在 —— 直接 rename 就行。
+  }
+
+  try {
     await rename(partPath, destination)
   } catch (error) {
+    // 回滚：把旧二进制放回去，别让用户连旧的都没了。
+    if (backupMade) {
+      await rename(backupPath, destination).catch(() => undefined)
+    }
     await rm(partPath, { force: true }).catch(() => undefined)
     throw new Error(
       `把下载好的文件挪到 ${destination} 失败：${
         error instanceof Error ? error.message : String(error)
       }。请检查磁盘空间与文件权限。`,
     )
+  }
+
+  if (backupMade) {
+    await rm(backupPath, { force: true }).catch(() => undefined)
   }
   if (process.platform !== 'win32') {
     await chmod(destination, 0o755)

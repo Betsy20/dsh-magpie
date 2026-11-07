@@ -181,6 +181,20 @@ const INJECTED_HTML_SCRIPT = `<script>
   var isPanel = new URLSearchParams(location.search).get("mode") === "panel";
 
   /**
+   * 父窗口的 origin。
+   *
+   * ⚠️ 不能用 \`"*"\` —— 那等于「任何窗口都能收」。iframe 和宿主**不同源**
+   * （宿主是 DSH 的端口，我们是代理端口），所以不能省，但可以用
+   * \`document.referrer\` 拿到宿主的源。拿不到时退回 \`"*"\`（功能优先）。
+   */
+  var parentOrigin = "*";
+  try {
+    if (document.referrer) {
+      parentOrigin = new URL(document.referrer).origin;
+    }
+  } catch (e) {}
+
+  /**
    * 把 \`window/*\` 这类「桌面窗口控制」的 RPC 转成宿主消息。
    *
    * ## 为什么包装 \`api()\` 而不是逐个拦按钮
@@ -214,7 +228,7 @@ const INJECTED_HTML_SCRIPT = `<script>
           kind: action,
           view: params.get("view") || "",
           tab: params.get("tab") || ""
-        }, "*");
+        }, parentOrigin);
       } catch (e) {}
       // 原语义是 async RPC —— 调用方会 \`await\`。返回 resolved Promise
       // 比 \`undefined\` 更贴近（有些调用点会 \`.then()\`）。
@@ -226,13 +240,22 @@ const INJECTED_HTML_SCRIPT = `<script>
   };
   // \`app.js\` 可能还没执行到（我们的 script 在 \`</body>\` 前，而 \`api()\`
   // 是它里面的顶层声明）—— 轮询到它出现为止。
-  if (!wrapApi()) {
+  //
+  // ⚠️ 用**指数退避**而不是固定 50ms：固定间隔的最长 5 秒上限在慢机器
+  //    首次加载时不够（69 MB 二进制解压 + 磁盘慢），超时后按钮就永远
+  //    没反应了。退避总时长约 30 秒，间隔封顶 1 秒，不会烧 CPU。
+  var scheduleWrap = function () {
     var tries = 0;
-    var timer = setInterval(function () {
+    var tick = function () {
+      if (wrapApi()) return;
       tries += 1;
-      if (wrapApi() || tries > 100) clearInterval(timer);
-    }, 50);
-  }
+      if (tries > 40) return;
+      var delay = Math.min(50 * Math.pow(2, tries), 1_000);
+      setTimeout(tick, delay);
+    };
+    tick();
+  };
+  if (!wrapApi()) scheduleWrap();
 
   // 完整页面：接收宿主的「切到某页」指令。
   if (!isPanel) {
@@ -241,7 +264,8 @@ const INJECTED_HTML_SCRIPT = `<script>
       if (!data || typeof data !== "object" || data.source !== "dsh-magpie-host") return;
       if (data.kind !== "show") return;
       var view = String(data.view || "");
-      if (!view) return;
+      // 只允许 \`data-view\` 里真实存在的形态 —— 拦掉任何畸形输入。
+      if (!/^[a-z0-9-]+$/.test(view)) return;
       // 设置页不是 \`#nav\` 里的一行，而是标题栏的齿轮。
       if (view === "settings") {
         var prefs = document.querySelector("#prefs");
@@ -250,7 +274,11 @@ const INJECTED_HTML_SCRIPT = `<script>
       }
       // 其余页面点 \`#nav\` 里对应的按钮 —— \`show()\` 是内部函数，但导航
       // 按钮的点击就是它唯一的入口，比直接调内部函数稳（不依赖函数名）。
-      var tab = document.querySelector('#nav button[data-view="' + view + '"]');
+      // ⚠️ 用 \`CSS.escape\` 转义 —— 虽然上面已经白名单过，多一层防御。
+      var escaped = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+        ? CSS.escape(view)
+        : view;
+      var tab = document.querySelector('#nav button[data-view="' + escaped + '"]');
       if (tab) tab.click();
     });
   }
@@ -412,6 +440,38 @@ async function login(baseUrl: string, key: string, timeoutMs: number): Promise<s
  * @param logger - 日志。
  * @returns 代理服务器与它实际监听的端口。
  */
+/**
+ * 把「绑定地址」转成「可以拿来做 TCP 连接的地址」。
+ *
+ * ## 为什么需要区分
+ *
+ * `0.0.0.0` / `::` 是**通配绑定**地址，表示「所有网卡」。它们能 `listen`，
+ * 但**不能用来建连** —— `fetch('http://0.0.0.0:3480')` 在部分平台上会
+ * 直接失败（Windows 上通常连到 `127.0.0.1`，Linux 上则可能拒绝）。
+ *
+ * 所以转发给上游、拼 iframe URL 时都要换成回环地址。
+ *
+ * ## ⚠️ 代理本身永远只监听回环
+ *
+ * 见 {@link startProxy} 的 `listenHost` 参数 —— **不要**把 `webHost` 直接
+ * 传进去。代理会在每个请求上注入 magpie 的登录 Cookie，一旦它监听
+ * `0.0.0.0`，任何能访问该端口的局域网客户端都会自动获得 magpie 的登录态，
+ * 管理界面完全敞开。绑定地址和连接地址必须解耦。
+ *
+ * @param host - 配置里的 `webHost`。
+ * @returns 可以建连的地址（通配地址换成对应的回环地址）。
+ */
+function connectHost(host: string): string {
+  const trimmed = host.trim()
+  if (trimmed === '' || trimmed === '0.0.0.0') {
+    return '127.0.0.1'
+  }
+  if (trimmed === '::' || trimmed === '[::]') {
+    return '::1'
+  }
+  return trimmed
+}
+
 async function startProxy(
   upstreamHost: string,
   upstreamPort: number,
@@ -457,14 +517,28 @@ async function startProxy(
           upstreamResponse.on('data', (chunk: Buffer) => {
             chunks.push(chunk)
           })
+          // 客户端中途断开（刷新、切页、关面板）时把上游也断掉 —— 否则
+          // 我们会继续把整个响应缓冲进内存，最后往一个已经消失的 socket 上
+          // 写。非 HTML 分支靠 `pipe` 自动处理，HTML 分支要自己接。
+          response.once('close', () => {
+            if (!response.writableEnded) {
+              upstreamResponse.destroy()
+              upstream.destroy()
+            }
+          })
           upstreamResponse.once('end', () => {
+            // 已经断开就别写了 —— `writeHead` 在 destroyed 的 response 上
+            // 会抛 `ERR_STREAM_DESTROYED`，变成未捕获异常。
+            if (response.destroyed) {
+              return
+            }
             let raw = Buffer.concat(chunks)
             // ⚠️ magpie 的 HTML 是 gzip/br 压缩的，直接在压缩字节上做字符串
             //    替换会得到乱码，而且浏览器拿到的是「解压后」的字节 —— 必须
             //    先解压，注入后再原样回填 content-encoding（这里直接去掉，
             //    让 Node 发未压缩的，省一次二次压缩）。
             const encoding = responseHeaders['content-encoding']
-            const algorithm = typeof encoding === 'string' ? encoding.toLowerCase() : ''
+            const algorithm = typeof encoding === 'string' ? encoding.toLowerCase().trim() : ''
             try {
               if (algorithm === 'gzip' || algorithm === 'x-gzip') {
                 raw = gunzipSync(raw)
@@ -472,15 +546,25 @@ async function startProxy(
                 raw = brotliDecompressSync(raw)
               } else if (algorithm === 'deflate') {
                 raw = inflateSync(raw)
-              }
-              if (algorithm !== '') {
-                delete responseHeaders['content-encoding']
+              } else if (algorithm !== '' && algorithm !== 'identity') {
+                // 不认识的编码（`zstd`、多值 `gzip, br` 之类）—— 不能瞎猜。
+                throw new Error(`不支持的 content-encoding: ${algorithm}`)
               }
             } catch (error) {
               logger.warn(
                 `[magpie] 解压 HTML 失败（${algorithm || 'identity'}）：` +
                   `${error instanceof Error ? error.message : String(error)}`,
               )
+              // ⚠️ 必须中止 —— 此时 `raw` 还是**压缩字节**，`toString('utf8')`
+              //    得到的是乱码，拼上注入脚本再重算 `content-length` 会让浏览器
+              //    收到一坨垃圾（白屏），而错误只出现在 debug 日志里。
+              response.destroy(error instanceof Error ? error : new Error(String(error)))
+              return
+            }
+            // 只有**成功解压**后才删 `content-encoding` —— 解压失败已经 return，
+            // 不会走到这里。
+            if (algorithm !== '' && algorithm !== 'identity') {
+              delete responseHeaders['content-encoding']
             }
             const html = raw.toString('utf8')
             const injected = html.includes('</body>')
@@ -568,17 +652,46 @@ async function startProxy(
         upstreamSocket.write(head)
       }
       upstreamSocket.pipe(socket).pipe(upstreamSocket)
+
+      // ⚠️ 用**升级后的两端 socket** 互相清理，不要用 `upstream`（那是
+      //    `ClientRequest`）的 `'close'` —— 它在 `'upgrade'` 之后**立刻**
+      //    触发（请求本身已经结束），会把刚建好的隧道当场销毁：magpie 的
+      //    实时推送刚连上就断，页面看起来「加载了但一直不更新」。
+      socket.once('close', () => {
+        upstreamSocket.destroy()
+      })
+      upstreamSocket.once('close', () => {
+        socket.destroy()
+      })
+      // `ECONNRESET` / `EPIPE` 在本地代理里是常态（刷新、重启上游），
+      // 没有 error 监听会变成未捕获异常，把宿主进程带走。
+      socket.once('error', () => {
+        upstreamSocket.destroy()
+      })
+      upstreamSocket.once('error', () => {
+        socket.destroy()
+      })
     })
     upstream.on('error', () => {
       socket.destroy()
     })
-    // 任一端断开时把另一端的 socket 也关掉 —— 否则会留下半开的 TCP 连接，
-    // 面板反复开关后句柄数只增不减。
-    socket.once('close', () => {
-      upstream.destroy()
-    })
-    upstream.once('close', () => {
-      socket.destroy()
+    // ⚠️ 上游**拒绝**升级（返回 400/404 而不是 101）时 `'upgrade'` 不会
+    //    触发，只会走 `'response'`。不处理的话浏览器会一直等在那个 socket
+    //    上（表现为页面一直转圈），必须把响应原样回写再结束。
+    upstream.on('response', (upstreamResponse) => {
+      const lines = [
+        `HTTP/1.1 ${String(upstreamResponse.statusCode ?? 502)} ${upstreamResponse.statusMessage ?? 'Bad Gateway'}`,
+      ]
+      for (const [name, value] of Object.entries(upstreamResponse.headers)) {
+        for (const item of toHeaderList(value)) {
+          lines.push(`${name}: ${item}`)
+        }
+      }
+      socket.write(`${lines.join('\r\n')}\r\n\r\n`)
+      upstreamResponse.pipe(socket)
+      upstreamResponse.once('error', () => {
+        socket.destroy()
+      })
     })
     upstream.end()
   })
@@ -601,7 +714,8 @@ async function startProxy(
  * 返回的默认地址。
  */
 export function mainWindowUrl(host: string, port: number): string {
-  return `http://${host}:${String(port)}/`
+  // ⚠️ 过 connectHost —— 配置成 0.0.0.0 / :: 时 iframe 连不上。
+  return `http://${connectHost(host)}:${String(port)}/`
 }
 
 /**
@@ -613,7 +727,8 @@ export function mainWindowUrl(host: string, port: number): string {
  * 的 `panelWidth`），所以 DSH 这边用同尺寸浮层。
  */
 export function dockWindowUrl(host: string, port: number): string {
-  return `http://${host}:${String(port)}/?mode=panel`
+  // ⚠️ 同 mainWindowUrl —— 过 connectHost。
+  return `http://${connectHost(host)}:${String(port)}/?mode=panel`
 }
 
 /**
@@ -635,9 +750,10 @@ function stopProcessTree(child: ChildProcess): void {
     return
   }
 
+  /** 最后一道兜底：`SIGKILL`（Windows 上等价于 `TerminateProcess`）。 */
   const fallback = (): void => {
     try {
-      child.kill()
+      child.kill('SIGKILL')
     } catch {
       /* 已经退出了 */
     }
@@ -647,16 +763,32 @@ function stopProcessTree(child: ChildProcess): void {
     try {
       child.kill('SIGTERM')
     } catch {
-      /* 已经退出了 */
+      return
     }
+    // ⚠️ 给 2 秒宽限再 `SIGKILL` —— `magpie serve` 在等网关释放时可能
+    //    忽略 `SIGTERM`（它要等另一个 magpie 退出），不兜底会留下孤儿进程
+    //    一直占着 3425/3480，下次 `ensure()` 再起一份就端口冲突。
+    const timer = setTimeout(fallback, 2_000)
+    timer.unref()
+    child.once('exit', () => {
+      clearTimeout(timer)
+    })
     return
   }
 
   try {
-    spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+    const killer = spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
       stdio: 'ignore',
       windowsHide: true,
-    }).on('error', fallback)
+    })
+    killer.once('error', fallback)
+    // ⚠️ `taskkill` **正常启动**但退出码非 0（权限不足、PID 不存在、
+    //    部分子进程结束不掉）也要兜底 —— 只监听 `'error'` 会漏掉这种。
+    killer.once('close', (code) => {
+      if (code !== 0) {
+        fallback()
+      }
+    })
   } catch {
     fallback()
   }
@@ -709,6 +841,24 @@ export class MagpieWebBridge {
   private child: ChildProcess | undefined
   private proxy: Server | undefined
   private disposed = false
+
+  /**
+   * 启动代数 —— 每次 `start()` 自增，用来让**旧进程的 `exit` 监听**
+   * 认出自己已经过期。
+   *
+   * ## ⚠️ 为什么不能只比 `this.child !== child`
+   *
+   * 这个比较在「旧进程退出 → 新进程启动」时是有效的，但**覆盖不了**
+   * 「旧进程的 `exit` 事件在新进程启动之后才派发」这种时序：那时
+   * `this.child` 已经是新进程了，旧监听看到不等就 `return` —— 这是对的。
+   * 反过来，如果旧进程先退出、`discardHandle()` 把 `this.child` 清成
+   * `undefined`，新进程又还没起来，那旧监听看到 `undefined !== child`
+   * 也会 `return`，同样没问题。
+   *
+   * 真正需要 `generation` 的是**启动期**：见 `start()` 里对
+   * `child.exitCode` 的检查。
+   */
+  private generation = 0
 
   /**
    * @param options - 桥参数。
@@ -881,6 +1031,9 @@ export class MagpieWebBridge {
     )
     this.child = child
 
+    // 这一轮启动的编号 —— 常驻 `exit` 监听靠它认出「我已经过期了」。
+    const generation = ++this.generation
+
     // 从这里开始进入「已经建起资源」的区域 —— 任何一步失败（含插件被卸载）
     // 都必须把 child / proxy 收干净，否则卸载后残留子进程与端口。
     let proxy: Server | undefined
@@ -972,10 +1125,19 @@ export class MagpieWebBridge {
       guard()
       logger.debug(`[magpie] 已取得登录 cookie（${cookie.split('=')[0] ?? '?'}）`)
 
-      const started = await startProxy(host, upstreamPort, cookie, host, logger)
+      const started = await startProxy(connectHost(host), upstreamPort, cookie, '127.0.0.1', logger)
       proxy = started.server
       this.proxy = proxy
       guard()
+
+      // ⚠️ 返回 handle 之前最后确认一次进程还活着 —— 临时 `exit` 监听在
+      //    `settle()` 里就被移除了，而 `await login()` / `await startProxy()`
+      //    期间进程可能已经退出（`exit` 事件早已触发，之后注册的
+      //    `once('exit')` 永远收不到）。这会让 `ensure()` 返回一个指向死端口
+      //    的句柄，首次请求就 `ECONNREFUSED 127.0.0.1:3480`。
+      if (child.exitCode !== null || !isProcessAlive(child.pid)) {
+        throw new Error('magpie web 在启动过程中退出')
+      }
 
       // 这里给的是**主窗口**（`/`）—— 完整页面，带 magpie 自己的侧边栏。
       //
@@ -1004,7 +1166,7 @@ export class MagpieWebBridge {
       //    代理继续转发到死端口（`ECONNREFUSED 127.0.0.1:3480`）。
       child.once('exit', (code, signal) => {
         // 已经换过进程（或已被 dispose）就不归这个监听管了。
-        if (this.child !== child) {
+        if (this.generation !== generation || this.child !== child) {
           return
         }
         logger.warn(
