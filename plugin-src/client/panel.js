@@ -34,6 +34,7 @@
  */
 
 import * as React from 'react'
+import { createPortal } from 'react-dom'
 
 import { unwrapMagpieResult } from './rpc.js'
 
@@ -177,6 +178,242 @@ export function MagpiePanel({ rpcCall }) {
 }
 
 /**
+ * 底部统计条上的「Magpie」按钮 —— 点击开小窗。
+ *
+ * ## 槽位契约（`conversation.composer.dock`，list + 会话作用域）
+ *
+ * 官方用它渲染两个统计 pill：`activity`（order 0，轮次数 / 步骤数 / 输出
+ * 速度）与 `usage`（order 1，token 总量 / 缓存命中）。我们注册 order 2，
+ * 排在它们右侧。
+ *
+ * ## ⚠️ 为什么开真窗口而不是 iframe
+ *
+ * 侧边栏「Magpie」入口里已经有一个 iframe 展示**主窗口**（完整页面，带
+ * magpie 自己的侧边栏）。小窗是 magpie 托盘图标那个 440×520 的紧凑形态，
+ * 它的价值就在于「浮在外面随时能看一眼」—— 塞回侧边栏里反而失去意义。
+ *
+ * ## ⚠️ 必须在点击时才请求 URL
+ *
+ * `web.dockUrl` 会 spawn `magpie web`（首次 20–30 秒）。如果在渲染期就调，
+ * 每次打开会话都会卡住整个输入区；而用户很可能根本不点这个按钮。
+ *
+ * @param {{ rpcCall?: Function }} props - 由槽位 `inject` 提供。
+ * @returns {import('react').ReactElement | null} 按钮。
+ */
+export function MagpieDockButton({ rpcCall }) {
+  const [busy, setBusy] = React.useState(false)
+  const [error, setError] = React.useState(null)
+  /** `null` = 小窗关闭；否则是要嵌进浮层的地址。 */
+  const [url, setUrl] = React.useState(null)
+
+  const open = React.useCallback(() => {
+    if (typeof rpcCall !== 'function' || busy) {
+      return
+    }
+    setBusy(true)
+    setError(null)
+    rpcCall('web.dockUrl')
+      .then(unwrapMagpieResult)
+      .then((value) => {
+        const next =
+          value !== null && typeof value === 'object' && typeof value.url === 'string' ? value.url : ''
+        if (next.length === 0) {
+          throw new Error('宿主没有返回小窗地址。')
+        }
+        setUrl(next)
+      })
+      .catch((reason) => {
+        setError(reason instanceof Error ? reason.message : String(reason))
+      })
+      .finally(() => {
+        setBusy(false)
+      })
+  }, [rpcCall, busy])
+
+  const close = React.useCallback(() => {
+    setUrl(null)
+  }, [])
+
+  // Esc 关闭 —— 浮层盖住了整个界面，没有快捷键就只能点那个小叉。
+  React.useEffect(() => {
+    if (url === null) {
+      return undefined
+    }
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        setUrl(null)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [url])
+
+  const label = busy ? 'Magpie 启动中…' : error === null ? 'Magpie' : 'Magpie 打不开'
+
+  return h(
+    React.Fragment,
+    null,
+    h(
+      'button',
+      {
+        type: 'button',
+        className: 'dim-mp-dockBtn' + (error === null ? '' : ' isError'),
+        onClick: open,
+        disabled: busy,
+        title: error === null ? '打开 magpie 小窗' : `打开失败：${error}`,
+      },
+      h('span', { className: 'dim-mp-dockDot', 'aria-hidden': 'true' }),
+      label,
+    ),
+    url === null
+      ? null
+      : // ⚠️ 必须用 portal 挂到 document.body。
+        //    composer 的祖先链上有 `transform` / `contain`，会让
+        //    `position: fixed` 退化成 `absolute` —— 浮层就成了流内元素，
+        //    把底部统计条顶起来。portal 直接挂到 body，彻底脱离那层布局。
+        createPortal(h(MagpieDockWindow, { url, onClose: close }), document.body),
+  )
+}
+
+/**
+ * 小窗浮层本体。
+ *
+ * ## ⚠️ 为什么是 `position: fixed` 浮层而不是 `window.open`
+ *
+ * Electron 的 `window.open` 会被宿主接走并交给**系统浏览器**（DSH 把它映射成
+ * `shell.openExternal`）—— 点一下按钮就跳到浏览器新标签页，完全脱离 DSH。
+ * 这里要的是「在 DSH 里浮一个小窗」，所以自己画一层 fixed 定位的浮层，里面
+ * 仍旧是 iframe。
+ *
+ * ## 为什么盖满全屏
+ *
+ * 只盖住右下角会让浮层下面**还能点到** composer 的按钮，用户会以为点到了但
+ * 没反应。半透明遮罩 + 点击关闭是最省心的交互。
+ *
+ * @param {{ url: string, onClose: () => void }} props - `url` 是小窗地址。
+ * @returns {import('react').ReactElement} 浮层。
+ */
+/**
+ * 让侧边栏里的 Magpie 完整页面切到某一页。
+ *
+ * ## 为什么不能直接调 `show()`
+ *
+ * 完整页面是**另一个 iframe**（{@link MagpiePanel} 渲染的），和小窗不同源
+ * 上下文 —— 拿不到它的 `window`。只能 `postMessage`。
+ *
+ * ## 为什么要轮询
+ *
+ * 刚点完侧边栏那一行时，`iframe` 可能还没挂载、或者还在加载 HTML ——
+ * 此时 `contentWindow` 是 `null`（或还没有我们的注入脚本）。轮询几次，
+ * 拿到就停。
+ *
+ * @param view - magpie 的页面 id（`agents` / `usage` / `routing` / `settings` …）。
+ */
+function showMagpiePage(view) {
+  let tries = 0
+  const tick = () => {
+    tries += 1
+    // `.dim-mp-frame` 是 MagpiePanel 的 iframe —— 只有侧边栏的完整页面
+    // 用它；小窗的是 `.dim-mp-dockFrame`，不会误伤。
+    const frame = document.querySelector('iframe.dim-mp-frame')
+    const target = frame?.contentWindow
+    if (target !== null && target !== undefined) {
+      try {
+        target.postMessage({ source: 'dsh-magpie-host', kind: 'show', view }, '*')
+        return
+      } catch {
+        // 跨源时可能抛 —— 继续重试没有意义，交给下一轮。
+      }
+    }
+    // 最多约 3 秒（20 × 150ms），超过就放弃 —— 页面根本没开的话，
+    // 静默失败比无限重试好。
+    if (tries < 20) {
+      setTimeout(tick, 150)
+    }
+  }
+  // 第一轮也延迟，等 React 把侧边栏那一行渲染出来。
+  setTimeout(tick, 150)
+}
+
+function MagpieDockWindow({ url, onClose }) {
+  // 代理注入了脚本（`src/web-bridge.ts` 的 INJECTED_HTML_SCRIPT），它把
+  // `api("window/...")` 这类 **Wails 桌面 RPC** 全部转成这里的消息。
+  //
+  // ## 为什么要包装 `api()` 而不是逐个拦按钮
+  //
+  // 原版 magpie 的 `?mode=panel` 是桌面 App（Wails）的小窗模式，它把
+  // 「打开主窗口」「设置」「退出」以及「打开用量」「打开路由」这些按钮的
+  // 点击全部交给 Go 后端的桌面进程 —— 浏览器里 `/api/window/*` 根本不存在，
+  // 点了完全没反应。后两个按钮还是**动态生成、没有 id** 的，只能靠文本
+  // 匹配（会随语言变）。它们唯一的共同点是都调 `api("window/main?...")`。
+  //
+  // 所以我们接管成 DSH 自己的行为：
+  // - `window/main` = 跳转到侧边栏的 Magpie 完整页面（**不是**在小窗里换
+  //   src —— 那只是把 440px 的浮层塞成完整布局，用户要的是回到主界面），
+  //   带了 `view` 就再切到那一页；
+  // - `window/quit` = 关闭小窗。
+  React.useEffect(() => {
+    const onMessage = (event) => {
+      const data = event.data
+      if (data === null || typeof data !== 'object' || data.source !== 'dsh-magpie') {
+        return
+      }
+      const kind = data.kind
+      if (kind === 'quit') {
+        onClose()
+        return
+      }
+      if (kind !== 'main') {
+        return
+      }
+      const view = typeof data.view === 'string' ? data.view : ''
+      // 侧边栏那一行是 DSH 自己渲染的（`sidebar.panellist` 槽位），点击
+      // 由它接管。`data-magpie-sidebar` 是我们挂在图标上的锚点，往上找
+      // 最近的可点击祖先 —— 不同版本的 DSH 可能用 `button` / `li` / `a`。
+      const anchor = document.querySelector('[data-magpie-sidebar]')
+      const row = anchor?.closest('button, li, a, [role="button"], [tabindex]') ?? anchor
+      row?.click()
+      onClose()
+      if (view.length > 0) {
+        // 完整页面挂载后才切页 —— 刚点完侧边栏时 iframe 可能还在加载，
+        // 直接 postMessage 会丢。轮询几次，拿到就停。
+        showMagpiePage(view)
+      }
+    }
+    window.addEventListener('message', onMessage)
+    return () => {
+      window.removeEventListener('message', onMessage)
+    }
+  }, [onClose])
+
+  return h(
+    'div',
+    { className: 'dim-mp-dockOverlay', onClick: onClose, role: 'presentation' },
+    h(
+      'div',
+      {
+        className: 'dim-mp-dockWindow',
+        onClick: (event) => {
+          // 点浮层内部不该关闭 —— 否则在 iframe 里选文字都会被当成「点外面」。
+          event.stopPropagation()
+        },
+        role: 'dialog',
+        'aria-label': 'Magpie 小窗',
+      },
+      h('iframe', {
+        className: 'dim-mp-dockFrame',
+        src: url,
+        title: 'Magpie 小窗',
+        allow: 'clipboard-read; clipboard-write',
+        referrerPolicy: 'no-referrer',
+      }),
+    ),
+  )
+}
+
+/**
  * 侧栏图标 —— 纯 SVG，`currentColor` 跟随主题。
  *
  * @param {{ size?: number }} props - `size` 是行高（像素），缺省 16。
@@ -186,6 +423,9 @@ export function MagpieSidebarIcon({ size }) {
   const px = typeof size === 'number' && size > 0 ? size : 16
   // 六边形 + 中心点：magpie 的 logo 是一只鸟的抽象，这里取它的几何骨架 ——
   // 比任何写实图形在小尺寸下都更稳。
+  //
+  // ⚠️ `data-magpie-sidebar` 是给 {@link MagpieDockWindow} 用的锚点：小窗里
+  //    点「打开主窗口」时，它靠这个选择器找到侧边栏这一行并 `click()`。
   return h(
     'svg',
     {
@@ -195,6 +435,7 @@ export function MagpieSidebarIcon({ size }) {
       fill: 'none',
       'aria-hidden': 'true',
       focusable: 'false',
+      'data-magpie-sidebar': '',
     },
     h('path', {
       d: 'M8 1.6 13.5 4.7v6.6L8 14.4 2.5 11.3V4.7L8 1.6Z',

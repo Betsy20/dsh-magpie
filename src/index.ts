@@ -38,9 +38,9 @@ import type { Context } from '@deepseek-ai/cordis'
 
 import { resolveOptions, type MagpieOptions } from './config.js'
 import { describeSource, resolveMagpieBinary } from './binary.js'
+import { dockWindowUrl, MagpieWebBridge } from './web-bridge.js'
 import { ensureMagpieBinary } from './download.js'
 import { LOG_PREFIX } from './product.js'
-import { MagpieWebBridge } from './web-bridge.js'
 
 /** 面板 RPC 的 HTTP 路径（POST）。 */
 export const PANEL_API_PATH = '/api/magpie'
@@ -181,6 +181,32 @@ function registerPanelRpc(
         try {
           const handle = await (await getBridge()).ensure()
           return { ok: true, value: { url: handle.url, port: handle.port } }
+        } catch (error) {
+          return {
+            ok: false,
+            error: {
+              code: 'magpie/web-unavailable',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          }
+        }
+      }
+      case 'web.dockUrl': {
+        // 小窗 URL（`?mode=panel`）—— composer 输入框右侧那个按钮点开
+        // 的弹窗用。和 `web.url` 共用同一个 `magpie web` 实例，只是路径不
+        // 一样，所以不会多起进程。
+        if (!options.webEnabled) {
+          return {
+            ok: false,
+            error: {
+              code: 'magpie/web-disabled',
+              message: '原版 Web UI 已在设置里关闭（webEnabled: false）。',
+            },
+          }
+        }
+        try {
+          const handle = await (await getBridge()).ensure()
+          return { ok: true, value: { url: dockWindowUrl(options.webHost, handle.port) } }
         } catch (error) {
           return {
             ok: false,

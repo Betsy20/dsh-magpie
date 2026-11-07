@@ -73,6 +73,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createServer as createHttpServer, request as httpRequest, type Server } from 'node:http'
 import { createServer as createNetServer } from 'node:net'
+import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib'
 
 import { probeGateway } from './gateway.js'
 
@@ -135,6 +136,126 @@ const DROPPED_RESPONSE_HEADERS = new Set([
   'transfer-encoding',
   'upgrade',
 ])
+
+/**
+ * 注入到 magpie web 页面里的脚本 —— 把「桌面专属」按钮的点击转发给 DSH。
+ *
+ * ## 为什么需要
+ *
+ * 原版 magpie 的 `?mode=panel` 是**桌面 App（Wails）的小窗模式**，它把
+ * 三个按钮的点击全部交给 Go 后端的桌面进程 RPC：
+ *
+ * ```js
+ * function openSettings() {
+ *   if (mode !== "window") { api("window/main?view=settings", {}); return; }
+ *   show("settings");
+ * }
+ * $("#open").onclick     = () => api("window/main", {});
+ * $("#openMain").onclick = () => api("window/main", {});
+ * $("#quit").onclick     = () => api("window/quit", {});
+ * ```
+ *
+ * `/api/window/*` 在浏览器里**根本不存在**（那是 Wails 的私有通道），
+ * 所以三个按钮点了完全没反应。
+ *
+ * ## 做法
+ *
+ * 在 `app.js` **之后**再跑一段脚本，用 `capture` 阶段抢先拦住点击
+ * （`stopImmediatePropagation`），然后 `postMessage` 给父窗口 ——
+ * 我们的 `MagpieDockWindow` 会监听并接管：
+ *
+ * | 按钮 | 我们的行为 |
+ * | --- | --- |
+ * | `#openMain` | 切到完整页面（去掉 `?mode=panel`） |
+ * | `#prefs` | 切到完整页面并打开设置 |
+ * | `#quit` | 关闭小窗 |
+ *
+ * ⚠️ 必须用 `capture: true` —— `app.js` 给这些按钮赋的是 `onclick` 属性，
+ * 冒泡阶段会被它先执行。
+ */
+const INJECTED_HTML_SCRIPT = `<script>
+(function () {
+  if (window.__magpieDshBridge) return;
+  window.__magpieDshBridge = true;
+  // \`?mode=panel\` 是小窗（Wails 桌面 App 的紧凑形态），\`/\` 是完整页面。
+  var isPanel = new URLSearchParams(location.search).get("mode") === "panel";
+
+  /**
+   * 把 \`window/*\` 这类「桌面窗口控制」的 RPC 转成宿主消息。
+   *
+   * ## 为什么包装 \`api()\` 而不是逐个拦按钮
+   *
+   * 需要接管的按钮散落在三个文件里，**大多数没有稳定的 id**：
+   * - \`app.js\` 的 \`#openMain\`（打开主窗口）、\`#prefs\`（设置）、\`#quit\`（退出）
+   * - \`app.js\` 里 \`renderPanelUse\` 动态造的「打开用量」按钮
+   * - \`plugins/routing/client.js\` 动态造的「打开路由」按钮
+   *
+   * 后两个连 id 都没有，只能靠文本（会随语言变）—— 但它们
+   * **唯一共同点**是都调 \`api("window/...", {})\`，而浏览器里没有
+   * \`/api/window/*\` 这个端点。包装这一层，所有入口一起接管，
+   * 以后 magpie 加新按钮也自动生效。
+   *
+   * \`web\` 为真时 \`api("open")\` 已经走 \`window.open\`（真的开系统浏览器），
+   * 那条路径不拦 —— 那是外部链接，不是窗口控制。
+   */
+  var wrapApi = function () {
+    if (typeof window.api !== "function" || window.api.__dshWrapped) return false;
+    var original = window.api;
+    var wrapped = function (path, body, heads, signal) {
+      if (typeof path !== "string" || path.indexOf("window/") !== 0) {
+        return original.apply(this, arguments);
+      }
+      var query = path.indexOf("?") >= 0 ? path.slice(path.indexOf("?") + 1) : "";
+      var params = new URLSearchParams(query);
+      var action = path.slice("window/".length).split("?")[0];
+      try {
+        window.parent.postMessage({
+          source: "dsh-magpie",
+          kind: action,
+          view: params.get("view") || "",
+          tab: params.get("tab") || ""
+        }, "*");
+      } catch (e) {}
+      // 原语义是 async RPC —— 调用方会 \`await\`。返回 resolved Promise
+      // 比 \`undefined\` 更贴近（有些调用点会 \`.then()\`）。
+      return Promise.resolve(null);
+    };
+    wrapped.__dshWrapped = true;
+    window.api = wrapped;
+    return true;
+  };
+  // \`app.js\` 可能还没执行到（我们的 script 在 \`</body>\` 前，而 \`api()\`
+  // 是它里面的顶层声明）—— 轮询到它出现为止。
+  if (!wrapApi()) {
+    var tries = 0;
+    var timer = setInterval(function () {
+      tries += 1;
+      if (wrapApi() || tries > 100) clearInterval(timer);
+    }, 50);
+  }
+
+  // 完整页面：接收宿主的「切到某页」指令。
+  if (!isPanel) {
+    window.addEventListener("message", function (event) {
+      var data = event.data;
+      if (!data || typeof data !== "object" || data.source !== "dsh-magpie-host") return;
+      if (data.kind !== "show") return;
+      var view = String(data.view || "");
+      if (!view) return;
+      // 设置页不是 \`#nav\` 里的一行，而是标题栏的齿轮。
+      if (view === "settings") {
+        var prefs = document.querySelector("#prefs");
+        if (prefs) prefs.click();
+        return;
+      }
+      // 其余页面点 \`#nav\` 里对应的按钮 —— \`show()\` 是内部函数，但导航
+      // 按钮的点击就是它唯一的入口，比直接调内部函数稳（不依赖函数名）。
+      var tab = document.querySelector('#nav button[data-view="' + view + '"]');
+      if (tab) tab.click();
+    });
+  }
+})();
+</script>`
 
 /** 日志接口（只用到两档，避免依赖具体 logger 实现）。 */
 export interface WebBridgeLogger {
@@ -325,6 +446,60 @@ async function startProxy(
           }
           responseHeaders[name] = value
         }
+
+        // HTML 要**缓冲**后注入脚本（见 INJECTED_HTML_SCRIPT）；其余资源
+        // 继续走零拷贝 pipe。
+        const contentType = responseHeaders['content-type']
+        const isHtml =
+          typeof contentType === 'string' && contentType.toLowerCase().includes('text/html')
+        if (isHtml) {
+          const chunks: Buffer[] = []
+          upstreamResponse.on('data', (chunk: Buffer) => {
+            chunks.push(chunk)
+          })
+          upstreamResponse.once('end', () => {
+            let raw = Buffer.concat(chunks)
+            // ⚠️ magpie 的 HTML 是 gzip/br 压缩的，直接在压缩字节上做字符串
+            //    替换会得到乱码，而且浏览器拿到的是「解压后」的字节 —— 必须
+            //    先解压，注入后再原样回填 content-encoding（这里直接去掉，
+            //    让 Node 发未压缩的，省一次二次压缩）。
+            const encoding = responseHeaders['content-encoding']
+            const algorithm = typeof encoding === 'string' ? encoding.toLowerCase() : ''
+            try {
+              if (algorithm === 'gzip' || algorithm === 'x-gzip') {
+                raw = gunzipSync(raw)
+              } else if (algorithm === 'br') {
+                raw = brotliDecompressSync(raw)
+              } else if (algorithm === 'deflate') {
+                raw = inflateSync(raw)
+              }
+              if (algorithm !== '') {
+                delete responseHeaders['content-encoding']
+              }
+            } catch (error) {
+              logger.warn(
+                `[magpie] 解压 HTML 失败（${algorithm || 'identity'}）：` +
+                  `${error instanceof Error ? error.message : String(error)}`,
+              )
+            }
+            const html = raw.toString('utf8')
+            const injected = html.includes('</body>')
+              ? html.replace('</body>', `${INJECTED_HTML_SCRIPT}</body>`)
+              : html + INJECTED_HTML_SCRIPT
+            const body = Buffer.from(injected, 'utf8')
+            // 长度变了，`content-length` 必须重算 —— 否则浏览器会截断。
+            delete responseHeaders['content-length']
+            responseHeaders['content-length'] = String(body.byteLength)
+            response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders)
+            response.end(body)
+          })
+          upstreamResponse.once('error', (error: Error) => {
+            logger.debug(`[magpie] 上游 HTML 流错误：${error.message}`)
+            response.destroy(error)
+          })
+          return
+        }
+
         response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders)
         upstreamResponse.pipe(response)
 
@@ -420,6 +595,28 @@ async function startProxy(
 }
 
 /**
+ * 主窗口 URL（`/`）—— 完整页面，带 magpie 自己的侧边栏。
+ *
+ * DSH 侧边栏「Magpie」入口打开的就是它，也是 {@link MagpieWebBridge.ensure}
+ * 返回的默认地址。
+ */
+export function mainWindowUrl(host: string, port: number): string {
+  return `http://${host}:${String(port)}/`
+}
+
+/**
+ * 小窗 URL（`/?mode=panel`）—— magpie 托盘图标点开的那个紧凑形态。
+ *
+ * 前端在 `internal/gui/assets/app.js:5` 读 `params.get("mode")`，`"panel"` 时
+ * 切到只有四个页签（Agent / 额度 / 用量 / 路由）+ 底部按钮的布局，不渲染
+ * 侧边栏。桌面 App 的小窗宽 440、高 520（`internal/gui/textsize.go:14`
+ * 的 `panelWidth`），所以 DSH 这边用同尺寸浮层。
+ */
+export function dockWindowUrl(host: string, port: number): string {
+  return `http://${host}:${String(port)}/?mode=panel`
+}
+
+/**
  * 停掉子进程（Windows 上连**整棵进程树**）。
  *
  * ⚠️ `child.kill()` 在 Windows 上只给**直接**子进程发 `TerminateProcess`，
@@ -466,6 +663,41 @@ function stopProcessTree(child: ChildProcess): void {
 }
 
 /**
+ * 判断一个 PID 对应的进程是否还活着。
+ *
+ * ## 为什么需要这个
+ *
+ * `ensure()` 成功后会把句柄缓存进 `this.handle`，之后所有调用都直接返回
+ * 缓存 —— 但 **magpie 进程可能已经死了**（被杀、崩溃、被安全软件拦）。
+ * 这时代理还在监听，转发到死端口就报 `ECONNREFUSED 127.0.0.1:3480`，
+ * 而 `ensure()` 因为句柄缓存「成功」返回，永远不会重试。
+ *
+ * ## 实现
+ *
+ * `process.kill(pid, 0)` 不发信号，只做**存在性检查**：
+ * - 进程存在 → 正常返回
+ * - 进程不存在 → 抛 `ESRCH`
+ *
+ * ⚠️ Windows 上 `ESRCH` 之外还可能抛 `EPERM`（进程存在但没权限），
+ *    这种情况要算「活着」，否则会误判成死亡而重启进程。
+ *
+ * @param pid - 目标进程 ID。
+ * @returns 进程是否还活着。
+ */
+function isProcessAlive(pid: number | undefined): boolean {
+  if (pid === undefined) {
+    return false
+  }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // `EPERM` = 进程存在但没权限发信号 ⇒ 活着。
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
  * `magpie web` 子进程 + 认证代理的管理器。
  *
  * 单例语义由调用方保证（插件里只建一个）。并发调用 {@link ensure} 会共享
@@ -495,9 +727,14 @@ export class MagpieWebBridge {
     if (this.disposed) {
       throw new Error('Web 桥已卸载')
     }
-    if (this.handle !== undefined) {
+    // ⚠️ 除非**进程还活着**，否则不能信缓存 —— magpie 可能被杀/崩了，
+    //    这时代理还在监听却转发到死端口（`ECONNREFUSED 127.0.0.1:3480`），
+    //    而句柄缓存会让 `ensure()` 永远「成功」返回，不会重试。
+    if (this.handle !== undefined && isProcessAlive(this.handle.pid)) {
       return this.handle
     }
+    // 进程死了就丢掉残留的代理和句柄，走下面的重启路径。
+    this.discardHandle()
     if (this.starting === undefined) {
       this.starting = this.start().finally(() => {
         this.starting = undefined
@@ -518,27 +755,51 @@ export class MagpieWebBridge {
 
     // 先关代理，再杀子进程 —— 顺序反了的话，正在转发的请求会先撞上
     // 连接被拒，日志里多出一堆噪声。
-    const proxy = this.proxy
-    this.proxy = undefined
-    if (proxy !== undefined) {
-      try {
-        // `close()` 只停止接收新连接；已经建立的 keep-alive、SSE 流和
-        // WebSocket 会一直挂着。`closeAllConnections()` 主动断掉它们
-        // （Node 18.2+ 提供）。
-        proxy.closeAllConnections?.()
-        proxy.close()
-      } catch (error) {
-        this.options.logger.warn(
-          `[magpie] 关闭代理失败：${error instanceof Error ? error.message : String(error)}`,
-        )
-      }
-    }
+    this.closeProxy()
 
     const child = this.child
     this.child = undefined
     this.handle = undefined
     if (child !== undefined) {
       stopProcessTree(child)
+    }
+  }
+
+  /**
+   * 丢掉一个**已经死了**的子进程留下的句柄和代理。
+   *
+   * 和 {@link dispose} 的区别：这里**不杀进程**（它已经没了），只做清理，
+   * 让下一次 `ensure()` 走完整的重启路径。
+   *
+   * @private
+   */
+  private discardHandle(): void {
+    this.closeProxy()
+    this.child = undefined
+    this.handle = undefined
+  }
+
+  /**
+   * 关掉代理服务器（不碰子进程）。
+   *
+   * @private
+   */
+  private closeProxy(): void {
+    const proxy = this.proxy
+    this.proxy = undefined
+    if (proxy === undefined) {
+      return
+    }
+    try {
+      // `close()` 只停止接收新连接；已经建立的 keep-alive、SSE 流和
+      // WebSocket 会一直挂着。`closeAllConnections()` 主动断掉它们
+      // （Node 18.2+ 提供）。
+      proxy.closeAllConnections?.()
+      proxy.close()
+    } catch (error) {
+      this.options.logger.warn(
+        `[magpie] 关闭代理失败：${error instanceof Error ? error.message : String(error)}`,
+      )
     }
   }
 
@@ -716,7 +977,17 @@ export class MagpieWebBridge {
       this.proxy = proxy
       guard()
 
-      const url = `http://${host}:${String(started.port)}/`
+      // 这里给的是**主窗口**（`/`）—— 完整页面，带 magpie 自己的侧边栏。
+      //
+      // magpie 的桌面 App 用两个窗口跑同一套前端：主窗口加载 `/`，托盘图标
+      // 点开的小窗加载 `/?mode=panel`（见 `internal/gui/app.go` 的
+      // `panelOptions`，`Width: panelWidth` = 440，`Height: 520`）。前端在
+      // `app.js:5` 读 `params.get("mode")`。
+      //
+      // DSH 侧边栏里的「Magpie」入口要的是**完整页面**，所以这里用 `/`；
+      // 小窗（`?mode=panel`）由 composer 输入框右侧的按钮另开一个弹窗，
+      // 走 {@link dockWindowUrl} 这个独立方法。
+      const url = mainWindowUrl(host, started.port)
       const handle: MagpieWebHandle = {
         url,
         port: started.port,
@@ -725,6 +996,24 @@ export class MagpieWebBridge {
       }
       this.handle = handle
       logger.debug(`[magpie] 代理就绪：${url} → ${host}:${String(upstreamPort)}`)
+
+      // ⚠️ 常驻 exit 监听 —— `settle()` 在 resolve 时已经移除了**临时的**
+      //    `onExit`（那个只负责把「启动期就失败」变成 reject）。这里补一个
+      //    跑完全程的：magpie 之后任何时刻退出（被杀、崩溃、被安全软件
+      //    拦），都要清掉句柄和代理，否则 `ensure()` 会一直返回死句柄，
+      //    代理继续转发到死端口（`ECONNREFUSED 127.0.0.1:3480`）。
+      child.once('exit', (code, signal) => {
+        // 已经换过进程（或已被 dispose）就不归这个监听管了。
+        if (this.child !== child) {
+          return
+        }
+        logger.warn(
+          `[magpie] web 进程已退出（code=${String(code)}, signal=${String(signal)}），` +
+            '下次打开面板会重新拉起',
+        )
+        this.discardHandle()
+      })
+
       return handle
     } catch (error) {
       // 启动失败或插件已卸载：把这一轮建起来的资源全部收掉，不留残留。

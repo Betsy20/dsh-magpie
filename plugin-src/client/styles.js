@@ -43,7 +43,10 @@ const STYLES = `
   flex-direction: column;
   width: 100%;
   height: 100%;
-  min-height: 0;
+  /* ⚠️ 必须给最小高度 —— settings.section 槽位的宿主容器高度是 auto
+   * （由内容撑开），height:100% 在这里退化成 auto，iframe 就只剩
+   * 浏览器默认的 150px，下方留一大片空白。 */
+  min-height: 600px;
   box-sizing: border-box;
   /* main 槽宿主只给顶部 28px 标题带，左右下不留白；iframe 要铺满其余空间。 */
   padding: 0;
@@ -56,7 +59,8 @@ const STYLES = `
   display: block;
   flex: 1 1 auto;
   width: 100%;
-  min-height: 0;
+  height: 100%;
+  min-height: 600px;
   border: 0;
   background: var(--dsw-alias-bg-layer-3, #ffffff);
 }
@@ -157,6 +161,102 @@ const STYLES = `
 .dim-mp-btn:focus-visible {
   outline: 2px solid #1677ff;
   outline-offset: 1px;
+}
+
+/* 底部统计条上的「Magpie」按钮 —— 点击开小窗。
+ *
+ * ⚠️ margin-left:auto 是**必须的**，用来把按钮推到统计条最右边。
+ *
+ * DSH 的统计条容器是 display:flex; justify-content:center; gap:12px
+ * （app.asar 里的 .GRgSLq_dock 类），而 ContextMeter（那个 12% 圆环）
+ * 是**硬编码在 renderSlot() 后面的兄弟节点**，不在槽位里 —— 所以无论
+ * order 多大，Magpie 都排不到它右边。margin-left:auto 会吸收左侧
+ * 的剩余空间，把按钮和 ContextMeter 一起推到右端，视觉上就脱离了
+ * 「夹在两个统计项中间」的位置。
+ */
+.dim-mp-dockBtn {
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dsw-alias-text-secondary, #5c6370);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: pointer;
+  transition:
+    color 0.12s ease,
+    background-color 0.12s ease,
+    border-color 0.12s ease;
+}
+
+.dim-mp-dockBtn:hover:not(:disabled) {
+  border-color: var(--dsw-alias-border-default, #e5e5e5);
+  background: var(--dsw-alias-bg-layer-2, #fafbfc);
+  color: #1677ff;
+}
+
+.dim-mp-dockBtn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.dim-mp-dockBtn:focus-visible {
+  outline: 2px solid #1677ff;
+  outline-offset: 1px;
+}
+
+.dim-mp-dockBtn.isError {
+  color: #cf1322;
+}
+
+.dim-mp-dockDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* ── 小窗浮层 ──
+ *
+ * ⚠️ 不能用 window.open()：Electron 会把它交给系统浏览器
+ * （DSH 映射成 shell.openExternal）。这里自己画一层 fixed 浮层。
+ *
+ * z-index 取 2147483000 而不是常见的 1000 —— DSH 自己的弹层（设置、
+ * 模型选择器）动辄到 10000 以上，小一点就被压在下面。
+ */
+.dim-mp-dockOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 0 24px 96px;
+  background: rgb(0 0 0 / 12%);
+}
+
+.dim-mp-dockWindow {
+  display: flex;
+  flex-direction: column;
+  width: 440px;
+  height: 520px;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-default, #e5e5e5);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-3, #fff);
+  box-shadow: 0 12px 40px rgb(0 0 0 / 18%);
+}
+
+.dim-mp-dockFrame {
+  display: block;
+  flex: 1 1 auto;
+  width: 100%;
+  border: 0;
 }
 `
 

@@ -35,7 +35,7 @@
 import * as React from 'react'
 
 import { withErrorBoundary } from './error-boundary.js'
-import { MagpiePanel, MagpieSidebarIcon } from './panel.js'
+import { MagpieDockButton, MagpiePanel, MagpieSidebarIcon } from './panel.js'
 import { callMagpieRpc } from './rpc.js'
 import { installMagpieStyles } from './styles.js'
 
@@ -71,6 +71,22 @@ const SIDEBAR_ORDER = 60
 /** 设置节的排序权重。 */
 const SETTINGS_ORDER = 60
 
+/**
+ * 底部统计条上的排序权重 —— **排到最尾部**。
+ *
+ * ## 为什么是 1000 而不是 2
+ *
+ * 官方那两个 pill 是 `activity`（order 0，轮次/步骤/速度）与 `usage`
+ * （order 1，token/缓存命中），但这条统计条上还有**别的东西**：DSH 内置的
+ * `ContextMeter`（上下文用量圆环，截图里那个 `10%`）注册在更靠右的位置。
+ *
+ * 最初我们写 `order: 2`，结果按钮被插在 `usage` 和 `ContextMeter` **中间**
+ * —— 用户要求「移动尾部，而不是插入中间」。DSH 生态里 `order: 100` 已经
+ * 是常用的大值（内置组件大量使用），所以取 `1000` 确保排在所有内置条目
+ * 之后：以后 DSH 再加新的统计 pill 也不会被我们挤到左边。
+ */
+const DOCK_ORDER = 1000
+
 const h = React.createElement
 
 /**
@@ -81,6 +97,12 @@ const MagpiePanelForMain = withErrorBoundary(MagpiePanel, { label: 'Magpie 面�
 
 /** 与 `MagpiePanelForMain` 分开两个常量，让兜底文案能区分是哪一处坏了。 */
 const MagpiePanelForSettings = withErrorBoundary(MagpiePanel, { label: 'Magpie 设置页' })
+
+/**
+ * 底部按钮同样要包错误边界 —— 它渲染在 composer 里，一处抛错会把整个输入区
+ * 一起带走（用户就再也没法发消息了）。
+ */
+const MagpieDockButtonForDock = withErrorBoundary(MagpieDockButton, { label: 'Magpie 底部按钮' })
 
 /**
  * 构造 `rpcCall` 闭包。
@@ -142,6 +164,23 @@ export function apply(ctx) {
         inject: () => ({ rpcCall: makeRpcCall(ctx) }),
       },
       MagpiePanelForSettings,
+    ),
+  )
+
+  // ── 入口四：底部统计条上的按钮（点击开小窗） ──
+  //
+  // 这个槽是 **list + 会话作用域**（`conversation.composer.dock`），官方在
+  // 这里渲染 `activity`（order 0）与 `usage`（order 1）两个统计 pill。
+  // 我们只提供渲染体，不需要 `sessionId`，所以 `inject` 直接给 `rpcCall`。
+  ctx.slots.inject('conversation.composer.dock', () =>
+    ctx.slots.register(
+      {
+        name: 'conversation.composer.dock',
+        id: PANEL_KEY,
+        order: DOCK_ORDER,
+        inject: () => ({ rpcCall: makeRpcCall(ctx) }),
+      },
+      MagpieDockButtonForDock,
     ),
   )
 }
