@@ -141,7 +141,10 @@ function pathEntries(platform = osPlatform()): readonly string[] {
 /** 在 `PATH` 里找第一个可执行的 `magpie`。 */
 async function findInPath(platform = osPlatform()): Promise<string | undefined> {
   const name = binaryFileName(platform)
-  for (const dir of pathEntries()) {
+  // ⚠️ 必须把 `platform` 传下去 —— 否则 `pathEntries()` 会用 `osPlatform()`
+  //    的默认值，跨平台测试（传 `'linux'` 进来）会拿到宿主的 `;` 分隔符，
+  //    整个 PATH 变成一个巨大的路径。
+  for (const dir of pathEntries(platform)) {
     const candidate = join(dir, name)
     if (await isExecutableFile(candidate, platform)) return candidate
   }
