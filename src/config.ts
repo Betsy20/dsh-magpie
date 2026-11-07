@@ -134,8 +134,9 @@ export const DEFAULT_OPTIONS: MagpieOptions = Object.freeze({
 /**
  * 插件 Config schema。
  *
- * `id: magpie` 与 {@link PROVIDER} 一致 —— DSH 0.1.7-rc.1 起设置表单的
- * 命名空间就是 profile 条目 id，两者不一致时设置页读不到本插件的配置。
+ * 设置表单的命名空间就是 cordis 条目 id（`magpie`，见 `index.ts` 的
+ * `export const name`），与 `package.json` 的 `name` 必须一致 —— 不一致时
+ * 设置页读不到本插件的配置。
  */
 export const Config = Schema.object({
   baseURL: Schema.string()

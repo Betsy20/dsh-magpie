@@ -1,36 +1,35 @@
 /**
- * DSH 插件入口：把 magpie 网关注册成一个 LLM provider。
+ * DSH 插件入口：把 magpie 原版 Web UI 嵌进 DSH 侧边栏。
+ *
+ * ## 这个插件**不**注册 provider
+ *
+ * DSH 接入 magpie 的模型**已经由 magpie 自己完成**，插件不需要重做：
+ *
+ * - `internal/agent/dsh.go`：`magpie dsh <model>` 会往
+ *   `~/.dsh/profiles/<name>/cordis.patch.yml` 写一条 `llm-pi-ai` 条目，
+ *   末尾带 `dshMark = "# magpie"` 标记；
+ * - 那条目的 `models` 来自 `provider.CatalogFor("dsh")` —— 就是你在 magpie
+ *   「Agents」页面挑选的可见模型（`magpie models dsh` 能原样列出，未挑的
+ *   显示为 `17 taken out of dsh's list`）；
+ * - 另有 drift 检查把被改坏的配置修回原样。
+ *
+ * ⇒ 插件只做一件官方没有的事：把 magpie 的原版 Web UI（`magpie web`）用
+ * iframe 嵌进 DSH 的侧边栏与设置弹层。
  *
  * ## 形状
  *
  * cordis 插件是**四个具名导出**（不能有 `default`）：
  *
  * ```ts
- * export const name = 'magpie'        // = package.json 的 name，也是 cordis.patch.yml 的 name
- * export const inject = ['llm']       // 只有 llm；connection 走惰性注入（见下）
+ * export const name = 'magpie'
+ * export const inject = []
  * export const Config = Schema.object({ ... })
  * export function apply(ctx, config) { ... }
  * ```
  *
  * ⚠️ **`default` 导出会让插件静默失效**：Loader 取 `default` 时拿不到本模块的
- * `name` / `inject`，fiber 会以空 inject 列表激活，第一次读 `ctx.llm` 就抛
- * `cannot get property "llm" without inject`。
- *
- * ## 为什么 `connection` 不进静态 `inject`
- *
- * `connection` 服务只由 Web bundle（`@deepseek-ai/dsh-client-connection`）提供，
- * headless / CLI profile 里**不存在**。静态列它会让本插件在那些 profile 里
- * 永久 pending，整个 profile 启动失败并报
- * `plugin tree failed to load: 1 entry did not activate`。
- * 面板 RPC 因此走 {@link Context.inject} 的**惰性**注入：有 connection 就挂，
- * 没有就安静跳过 —— 模型能力与 UI 通道彻底解耦。
- *
- * ## provider id
- *
- * 固定为 `magpie`（见 `product.ts` 的 {@link PROVIDER}）。⚠️ 同一个 provider
- * 只能有一个 adapter，重复注册会抛 `LlmError` code `DUPLICATE_ADAPTER` 并让
- * profile 启动失败 —— 因此安装本插件时**必须**把 profile 里原有的
- * `@deepseek-ai/dsh-llm-pi-ai` 的 `magpie` provider 段注释掉。
+ * `name` / `inject`，fiber 会以空 inject 列表激活，第一次读服务就抛
+ * `cannot get property "…" without inject`。
  *
  * @module dsh-magpie
  */
@@ -42,13 +41,12 @@ import type { Context } from '@deepseek-ai/cordis'
 //    会在插件激活时以 `Schema is not a function` 崩在 profile 启动阶段。
 import Schema from '@deepseek-ai/schemastery'
 
-import { MagpieAdapter } from './adapter.js'
 import { ModelCatalog } from './catalog.js'
 import { MagpieAdminClient, toSnapshotModel, type SnapshotModel } from './admin.js'
 import { resolveApiKey, resolveOptions, type MagpieOptions } from './config.js'
 import { describeSource, resolveMagpieBinary } from './binary.js'
 import { ensureMagpieBinary } from './download.js'
-import { LOG_PREFIX, PROVIDER } from './product.js'
+import { LOG_PREFIX } from './product.js'
 import type { RequestContext } from './http.js'
 import { MagpieWebBridge } from './web-bridge.js'
 
@@ -121,11 +119,19 @@ export const Config = Schema.object({
 export const name = 'magpie'
 
 /**
- * 静态依赖。
+ * 静态依赖：**空**。
  *
- * ⚠️ 只列 `llm`。`connection` 见模块头的说明。
+ * ⚠️ 不要列 `llm` —— 本插件**不注册 provider**。DSH 接入 magpie 的模型
+ * 已经由 magpie 自己完成（`internal/agent/dsh.go` 写的 `llm-pi-ai` 条目，
+ * 带 `# magpie` 标记，`models` 来自 `provider.CatalogFor("dsh")`）。
+ * 插件重复注册一个 provider 只会让模型选择器里出现两份同样的模型。
+ *
+ * ⚠️ 也**不要**列 `connection` —— 它只由 Web bundle 提供，headless / CLI
+ * profile 里不存在，静态列会让插件永久 pending 并导致
+ * `plugin tree failed to load: 1 entry did not activate`。
+ * 面板通道走 `ctx.inject(['connection'], ...)` 运行时取，拿不到就安静跳过。
  */
-export const inject = ['llm']
+export const inject: readonly string[] = []
 
 /** 插件日志接口（cordis 的 `ctx.logger` 是可选服务，故全部 `?.`）。 */
 interface MagpieLogger {
@@ -159,42 +165,6 @@ function makeLogger(ctx: Context): { debug(message: string): void; warn(message:
     warn: (message: string): void => {
       raw?.warn?.(message)
     },
-  }
-}
-
-/**
- * 造一个「把附件读成 data URL」的函数。
- *
- * ## 为什么不能静态 import 附件类型
- *
- * `@deepseek-ai/dsh-attachment` 只是 `@deepseek-ai/dsh-llm` 的
- * **devDependency** —— 运行时由宿主提供，但**没有**可被插件引用的类型入口。
- * 因此这里按结构化类型收窄到只用到的那一个方法（与 `dsh-providers-hub` 的
- * `makeReadImage` 同款）。
- *
- * ## 失败语义
- *
- * 抛错而不是返回占位文本：调用方（`messages.ts` 的 `resolveImageUrl`）会
- * 捕获并降级成 `[图片：当前请求未能内联该附件]`。这样「图片读不出来」不会
- * 让整轮对话失败，但历史里能看出发生了什么。
- *
- * @param ctx - 插件上下文。
- * @returns 附件 → `data:<mediaType>;base64,<…>`。
- */
-function makeReadImage(ctx: Context): (attachment: unknown) => Promise<string> {
-  return async (attachment: unknown): Promise<string> => {
-    const attachments = ctx.get('attachments') as
-      | {
-          readImage?: (
-            ref: never,
-          ) => Promise<{ data: Uint8Array; ref: { mediaType: string } }>
-        }
-      | undefined
-    if (typeof attachments?.readImage !== 'function') {
-      throw new Error('附件服务（attachments）不可用，无法内联图片')
-    }
-    const stored = await attachments.readImage(attachment as never)
-    return `data:${stored.ref.mediaType};base64,${Buffer.from(stored.data).toString('base64')}`
   }
 }
 
@@ -438,20 +408,14 @@ function registerPanelRpc(
 export function apply(ctx: Context, config?: unknown): void {
   const options = resolveOptions(config)
   const logger = makeLogger(ctx)
-  // `ModelCatalog` 与 `MagpieAdapter` 都收 **getter** 而不是值 —— 配置热重载
-  // （profile 的 `patchReload: "live"`）会重建插件 fiber，但同一 fiber 内也可能
-  // 被 `catalog.refresh` 等方法重新读取；用 getter 保证「读到的永远是当前值」。
+  // `ModelCatalog` 收 **getter** 而不是值 —— 配置热重载（profile 的
+  // `patchReload: "live"`）会重建插件 fiber，但同一 fiber 内也可能被
+  // `catalog.refresh` 等方法重新读取；用 getter 保证「读到的永远是当前值」。
   const catalog = new ModelCatalog(
     () => makeContext(options, undefined, undefined, logger),
     () => options,
     logger,
   )
-  const adapter = new MagpieAdapter({
-    catalog,
-    options: () => options,
-    readImage: makeReadImage(ctx),
-    logger,
-  })
 
   // 原版 Web UI 的进程桥：默认**惰性**启动（第一次 `web.url` 才 spawn），
   // 因此不打开面板时不会平白多一个 magpie 进程。
@@ -553,12 +517,6 @@ export function apply(ctx: Context, config?: unknown): void {
       },
     )
   }
-
-  // ⚠️ `registerAdapter` 内部已经 `ctx.effect(...)`，插件 fiber 卸载时自动注销，
-  //    这里**不要**再包一层 effect（双层释放会让 handle 第二次调用抛
-  //    `REGISTRATION_DISPOSED`）。
-  ctx.llm.registerAdapter([PROVIDER], adapter)
-  logger.debug(`${LOG_PREFIX} 已注册 provider "${PROVIDER}"（${options.baseURL}）`)
 
   // 面板通道：只有 Web profile 里才存在 connection，其余 profile 安静跳过。
   ctx.inject(['connection'], (connectionCtx) => {

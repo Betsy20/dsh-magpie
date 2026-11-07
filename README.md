@@ -1,15 +1,22 @@
 # dsh-magpie
 
-把 [magpie](https://github.com/yetone/magpie) 本机模型网关接入 DeepSeek Harness 的插件。
+把 [magpie](https://github.com/yetone/magpie) 的原版 Web UI 嵌进 DeepSeek Harness 侧边栏的插件。
 
-- **Provider**：`magpie-direct` —— 网关上的全部模型自动出现在 DSH 的模型选择器里
 - **面板**：侧边栏「Magpie」入口，iframe 嵌入 magpie 官方 Web UI
 
-> **为什么 id 是 `magpie-direct` 而不是 `magpie`**：DSH 桌面版内置了
-> `@deepseek-ai/dsh-llm-pi-ai`，它已经占用 provider id `magpie`，而且带一套自愈
-> 逻辑（只要配置里找不到启用的 `llm-pi-ai` 条目，宿主就会在几十秒内把整段配置
-> 追加回来）。同一个 provider id 只能挂一个 adapter —— 抢 `magpie` 会抛
-> `DUPLICATE_ADAPTER`，整个 profile 启动失败。所以本插件用独立 id 与它**并存**。
+> **这个插件不注册 provider。**
+>
+> DSH 接入 magpie 的模型**已经由 magpie 自己完成**：
+>
+> - `internal/agent/dsh.go`：`magpie dsh <model>` 会往
+>   `~/.dsh/profiles/<name>/cordis.patch.yml` 写一条 `llm-pi-ai` 条目，
+>   末尾带 `dshMark = "# magpie"` 标记；
+> - 那条目的 `models` 来自 `provider.CatalogFor("dsh")` —— 就是你在 magpie
+>   「Agents」页面挑选的可见模型（`magpie models dsh` 能原样列出，未挑的
+>   显示为 `17 taken out of dsh's list`）；
+> - 另有 drift 检查把被改坏的配置修回原样。
+>
+> 插件再注册一个 `magpie-direct` 只会让模型选择器里出现**两份**同样的模型。
 
 ## 前置条件
 
@@ -197,11 +204,8 @@ node node_modules/vitest/vitest.mjs run    # 63 个单测
 
 ```
 src/
-  index.ts        插件入口：注册 provider + 面板 RPC
-  adapter.ts      MagpieAdapter extends LlmAdapter（stream / listModels / resolveModel / prepareCall）
-  catalog.ts      模型目录（TTL 缓存 + /v1/models 解析 + 过滤）
-  messages.ts     DSH RequestMessage[] → OpenAI messages（含 tool_calls / 图片 / reasoning）
-  sse.ts          SSE 流解析（跨 chunk 多字节安全 + 空闲超时 + abort）
+  index.ts        插件入口：面板 RPC（**不**注册 provider）
+  catalog.ts      模型目录（TTL 缓存 + /v1/models 解析）
   http.ts         HTTP 客户端（错误分类 / 重试 / attribution headers）
   admin.ts        管理 API（quotas / usage / limit / concurrency / routes）
   gateway.ts      网关存活探测（/api/hello 轮询，避免把别人的 200 当成 magpie）
@@ -220,9 +224,18 @@ plugin-src/client/
   error-boundary.js  错误边界（防止渲染异常炸掉整棵子树）
 ```
 
-### provider 注册
+### 面板 RPC
 
-`ctx.llm.registerAdapter(['magpie-direct'], adapter)` —— 内部已 `ctx.effect`，插件卸载时自动注销。**不要再包一层** `ctx.effect`，否则二次释放会抛 `REGISTRATION_DISPOSED`。
+宿主侧 `registerPanelRpc` 提供四个方法：
+
+| 方法 | 返回 |
+|---|---|
+| `web.url` | `{ url, port }` —— 启动（或复用）`magpie serve --web` 子进程 |
+| `panel.snapshot` | `MagpieSnapshot` —— 模型目录 + 额度 + 用量 + 限流 + 并发 + 路由 |
+| `catalog.refresh` | `{ models, version }` —— 强制刷新模型目录 |
+| `gateway.version` | `{ version }` —— `/api/hello` 的版本号 |
+
+**返回值契约**：`connection.rpc.call()` 交回的是 `{ ok, value?, error? }` 信封 —— 宿主 `handleMethod` **必须**返回这个形状，返回裸对象会让客户端抛 `connection: invalid server-response result`（界面上只有一条红条，没有堆栈指向宿主）。
 
 ### 模型目录
 
