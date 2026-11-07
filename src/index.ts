@@ -295,6 +295,13 @@ export function apply(ctx: Context, config?: unknown): void {
   // 所以这里只建一个「取桥」的闭包，真正的桥在第一次 `await` 时才创建。
   let bridgePromise: Promise<MagpieWebBridge> | undefined
   let bridgeInstance: MagpieWebBridge | undefined
+  /**
+   * 插件生命周期信号。
+   *
+   * 下载可能持续几分钟（69 MB），插件卸载时必须能中断 —— 否则 DSH 退出后
+   * 还有一个进程在往 `~/.dsh/magpie/bin/` 里写文件。
+   */
+  const lifecycle = new AbortController()
 
   /**
    * 取（并首次创建）Web 桥。
@@ -310,9 +317,13 @@ export function apply(ctx: Context, config?: unknown): void {
       if (binary === undefined && options.autoDownloadMagpie) {
         logger.debug(`${LOG_PREFIX} 未找到 magpie 二进制，自动下载中（首次约 69 MB）…`)
         try {
-          await ensureMagpieBinary({ logger })
+          await ensureMagpieBinary({ logger, signal: lifecycle.signal })
           binary = await resolveMagpieBinary(options.magpieBinary)
         } catch (error) {
+          // 卸载打断的不算「下载失败」—— 直接抛出去，别刷 warn。
+          if (lifecycle.signal.aborted) {
+            throw error
+          }
           // 下载失败不算致命：用户可能就想连另一台机器上的网关。
           logger.warn(
             `${LOG_PREFIX} 自动下载 magpie 失败：${error instanceof Error ? error.message : String(error)}`,
@@ -336,7 +347,13 @@ export function apply(ctx: Context, config?: unknown): void {
       })
       bridgeInstance = bridge
       return bridge
-    })()
+    })().catch((error: unknown) => {
+      // ⚠️ 失败的 Promise 不能留在缓存里 —— 否则后续每次 `web.url` 都拿到
+      //    同一个 rejected Promise，用户关掉再打开面板也永远等不到重试机会。
+      //    `getBridge` 的前提是「失败一次可以再来一次」。
+      bridgePromise = undefined
+      throw error
+    })
     return bridgePromise
   }
 
@@ -344,6 +361,9 @@ export function apply(ctx: Context, config?: unknown): void {
   // ⚠️ 这里用 `bridgeInstance` 而不是 `bridgePromise` —— 卸载是同步的，
   //    不能 `await`；如果桥还没建出来，就没什么可关的。
   ctx.effect(() => () => {
+    // 先中断可能正在进行的下载，再关桥 —— 顺序反了的话下载会继续跑到
+    // 下一个 chunk 才停。
+    lifecycle.abort()
     bridgeInstance?.dispose()
   })
 

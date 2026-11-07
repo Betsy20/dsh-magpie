@@ -281,7 +281,7 @@ iframe 完全不需要浏览器保存任何 cookie，因此不受配额影响。
 ```bash
 git clone https://github.com/Betsy20/dsh-magpie.git && cd dsh-magpie
 npm install                                 # 触发 prepare → 生成 lib/
-node node_modules/vitest/vitest.mjs run     # 8 个单测
+node node_modules/vitest/vitest.mjs run     # 11 个单测
 ```
 
 `lib/` 是**生成物**，不在仓库里 —— 这是刻意为之，保证「仓库里看到的」与
@@ -293,11 +293,8 @@ node node_modules/vitest/vitest.mjs run     # 8 个单测
 # 全量构建（tsc + 客户端 esbuild）
 node scripts/build.mjs
 
-# 单测（8 个）
+# 单测（11 个）
 node node_modules/vitest/vitest.mjs run
-
-# 冒烟（真实网关）
-node scripts/smoke.mjs
 
 # 装配校验（检查 patch.yml 里每个 insert 能否加载）
 node scripts/verify-profile.mjs --profile desktop

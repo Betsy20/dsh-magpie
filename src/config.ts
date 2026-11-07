@@ -19,6 +19,7 @@
  */
 
 import Schema from '@deepseek-ai/schemastery'
+import { isVolatile } from '@deepseek-ai/cosmokit'
 import { DEFAULT_BASE_URL } from './product.js'
 
 /** 插件配置的**归一化后**形态（所有字段都有值）。 */
@@ -146,18 +147,44 @@ export const Config = Schema.object({
 export function resolveOptions(config: unknown): MagpieOptions {
   const raw = (typeof config === 'object' && config !== null ? config : {}) as Record<string, unknown>
 
-  const string = (key: keyof MagpieOptions, fallback: string): string => {
+  /**
+   * 取出字段的**原始值**。
+   *
+   * cordis 用 `Config` schema 解析配置后，`.volatile()` 标记的字段会被
+   * `Schema.resolve` 包成 `{ get(): T }` 引用（见 schemastery 的
+   * `Schema.resolve` 与 cosmokit 的 `createVolatile`）—— 这是为了让运行中的
+   * 插件能感知配置热更新。
+   *
+   * ⚠️ 不解包的话 `typeof value` 永远是 `'object'`，下面三个类型守卫会
+   * **全部**走 fallback 分支，用户配置被静默丢弃（`webPort: 4000` 变成
+   * `3480`，关掉自动下载也没用）。
+   *
+   * ⚠️ `isVolatile` 在 `@deepseek-ai/cosmokit`，**不在** schemastery ——
+   * 后者只 `export { Schema as default }`。
+   */
+  const read = (key: keyof MagpieOptions): unknown => {
     const value = raw[key]
+    return isVolatile(value) ? value.get() : value
+  }
+
+  const string = (key: keyof MagpieOptions, fallback: string): string => {
+    const value = read(key)
     return typeof value === 'string' && value.trim().length > 0 ? value.trim() : fallback
   }
-  const positiveNumber = (key: keyof MagpieOptions, fallback: number): number => {
-    const value = raw[key]
-    if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
-    if (value <= 0) return fallback
-    return Math.floor(value)
+  /**
+   * 端口必须落在 `1..65535`。
+   *
+   * 只判正数不够：`findFreePort()` 在 `port > 65_535` 时直接 `break`，
+   * 抛出来的错只会显示一个不完整的区间，排查成本高。
+   */
+  const port = (key: keyof MagpieOptions, fallback: number): number => {
+    const value = read(key)
+    if (typeof value !== 'number' || !Number.isInteger(value)) return fallback
+    if (value < 1 || value > 65_535) return fallback
+    return value
   }
   const boolean = (key: keyof MagpieOptions, fallback: boolean): boolean => {
-    const value = raw[key]
+    const value = read(key)
     return typeof value === 'boolean' ? value : fallback
   }
 
@@ -169,7 +196,7 @@ export function resolveOptions(config: unknown): MagpieOptions {
     autoDownloadMagpie: boolean('autoDownloadMagpie', DEFAULT_OPTIONS.autoDownloadMagpie),
     magpieBinary: string('magpieBinary', DEFAULT_OPTIONS.magpieBinary),
     webHost: string('webHost', DEFAULT_OPTIONS.webHost),
-    webPort: positiveNumber('webPort', DEFAULT_OPTIONS.webPort),
+    webPort: port('webPort', DEFAULT_OPTIONS.webPort),
     webKey: string('webKey', DEFAULT_OPTIONS.webKey),
   })
 }

@@ -327,15 +327,37 @@ async function startProxy(
         }
         response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders)
         upstreamResponse.pipe(response)
+
+        // 客户端中途断开（刷新、切页、关面板）时把上游也断掉 —— 否则
+        // magpie 会继续往一个已经消失的 socket 里写，白白占着连接。
+        response.once('close', () => {
+          if (!response.writableEnded) {
+            upstreamResponse.destroy()
+            upstream.destroy()
+          }
+        })
+        // 上游响应流自己的错误（连接被重置、解压失败）不会触发 `response`
+        // 的 `error`，必须单独接，否则会成为 unhandled error。
+        upstreamResponse.once('error', (error: Error) => {
+          logger.debug(`[magpie] 上游响应流错误：${error.message}`)
+          response.destroy(error)
+        })
       },
     )
 
     upstream.on('error', (error: Error) => {
-      logger.warn(`[magpie] 代理转发失败（${request.method ?? 'GET'} ${request.url ?? '/'}）：${error.message}`)
+      logger.warn(
+        `[magpie] 代理转发失败（${request.method ?? 'GET'} ${request.url ?? '/'}）：${error.message}`,
+      )
       if (!response.headersSent) {
         response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' })
       }
       response.end(`magpie 代理错误：${error.message}`)
+    })
+
+    // 请求体没发完客户端就断了（用户取消上传、浏览器关闭）—— 把上游也断掉。
+    request.once('aborted', () => {
+      upstream.destroy()
     })
 
     // 请求体直接流给上游（POST 表单 / 上传都走这条）。
@@ -375,6 +397,14 @@ async function startProxy(
     upstream.on('error', () => {
       socket.destroy()
     })
+    // 任一端断开时把另一端的 socket 也关掉 —— 否则会留下半开的 TCP 连接，
+    // 面板反复开关后句柄数只增不减。
+    socket.once('close', () => {
+      upstream.destroy()
+    })
+    upstream.once('close', () => {
+      socket.destroy()
+    })
     upstream.end()
   })
 
@@ -387,6 +417,52 @@ async function startProxy(
   })
 
   return { server, port }
+}
+
+/**
+ * 停掉子进程（Windows 上连**整棵进程树**）。
+ *
+ * ⚠️ `child.kill()` 在 Windows 上只给**直接**子进程发 `TerminateProcess`，
+ * magpie 派生的孙进程会活下来占着端口 —— 下一次 `ensure()` 于是再 spawn
+ * 一份，累积成「孤儿进程 + 端口被占」。`taskkill /T /F` 是唯一可靠的
+ * 树清理方式，失败才退回 `kill()`。
+ *
+ * 故意不 `await`：清理路径上的延迟不该拖住调用方，而 `taskkill` 本身
+ * 也是 fire-and-forget 语义。
+ *
+ * @param child - 要停掉的子进程。
+ */
+function stopProcessTree(child: ChildProcess): void {
+  const pid = child.pid
+  if (pid === undefined) {
+    return
+  }
+
+  const fallback = (): void => {
+    try {
+      child.kill()
+    } catch {
+      /* 已经退出了 */
+    }
+  }
+
+  if (process.platform !== 'win32') {
+    try {
+      child.kill('SIGTERM')
+    } catch {
+      /* 已经退出了 */
+    }
+    return
+  }
+
+  try {
+    spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    }).on('error', fallback)
+  } catch {
+    fallback()
+  }
 }
 
 /**
@@ -439,43 +515,30 @@ export class MagpieWebBridge {
    */
   dispose(): void {
     this.disposed = true
+
+    // 先关代理，再杀子进程 —— 顺序反了的话，正在转发的请求会先撞上
+    // 连接被拒，日志里多出一堆噪声。
     const proxy = this.proxy
     this.proxy = undefined
     if (proxy !== undefined) {
       try {
+        // `close()` 只停止接收新连接；已经建立的 keep-alive、SSE 流和
+        // WebSocket 会一直挂着。`closeAllConnections()` 主动断掉它们
+        // （Node 18.2+ 提供）。
+        proxy.closeAllConnections?.()
         proxy.close()
-      } catch {
-        /* 已经关了 */
+      } catch (error) {
+        this.options.logger.warn(
+          `[magpie] 关闭代理失败：${error instanceof Error ? error.message : String(error)}`,
+        )
       }
     }
+
     const child = this.child
     this.child = undefined
     this.handle = undefined
-    if (child === undefined || child.pid === undefined) {
-      return
-    }
-    const pid = child.pid
-    try {
-      if (process.platform === 'win32') {
-        spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
-          stdio: 'ignore',
-          windowsHide: true,
-        }).on('error', () => {
-          try {
-            child.kill()
-          } catch {
-            /* 已经退出了 */
-          }
-        })
-      } else {
-        child.kill('SIGTERM')
-      }
-    } catch (error) {
-      this.options.logger.warn(
-        `[magpie] 停止 magpie web（pid=${pid}）失败：${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      )
+    if (child !== undefined) {
+      stopProcessTree(child)
     }
   }
 
@@ -498,7 +561,23 @@ export class MagpieWebBridge {
       )
     }
 
+    /**
+     * 每个 `await` 之后重新确认插件还活着。
+     *
+     * ⚠️ `ensure()` 返回的 Promise 一旦开始就不会因为 `dispose()` 而中断 ——
+     * 卸载可能发生在任意两个 `await` 之间。不检查的话 `start()` 会一路跑到底：
+     * spawn 出 magpie、起好代理、最后把 `this.handle` 写回一个已经废弃的桥
+     * 实例。结果是**插件已卸载，magpie 子进程和代理仍在跑**。
+     */
+    const guard = (): void => {
+      if (this.disposed) {
+        throw new Error('Web 桥已卸载')
+      }
+    }
+
+    guard()
     const upstreamPort = await findFreePort(host, this.options.preferredPort, DEFAULT_PORT_ATTEMPTS)
+    guard()
 
     // ⚠️ `MAGPIE_WEB_KEY` 必须 16+ 位、只含 [A-Za-z0-9._~-]，否则 magpie 会
     //    拒绝启动并打印用法。校验放在这里，比等 30 秒超时好定位。
@@ -541,98 +620,131 @@ export class MagpieWebBridge {
     )
     this.child = child
 
-    const upstreamUrl = await new Promise<string>((resolve, reject) => {
-      let settled = false
-      let buffered = ''
+    // 从这里开始进入「已经建起资源」的区域 —— 任何一步失败（含插件被卸载）
+    // 都必须把 child / proxy 收干净，否则卸载后残留子进程与端口。
+    let proxy: Server | undefined
+    try {
+      guard()
 
-      const cleanup = (): void => {
-        clearTimeout(timer)
-        child.stdout?.off('data', onStdout)
-        child.stderr?.off('data', onStderr)
-        child.off('exit', onExit)
-        child.off('error', onError)
-      }
+      await new Promise<void>((resolve, reject) => {
+        let settled = false
+        let buffered = ''
 
-      const settle = (fn: () => void): void => {
-        if (settled) {
-          return
+        const cleanup = (): void => {
+          clearTimeout(timer)
+          child.stdout?.off('data', onStdout)
+          child.stderr?.off('data', onStderr)
+          child.off('exit', onExit)
+          child.off('error', onError)
         }
-        settled = true
-        cleanup()
-        fn()
-      }
 
-      const fail = (message: string): void => {
-        settle(() => {
-          this.child = undefined
-          try {
-            child.kill()
-          } catch {
-            /* 已经退出了 */
+        const settle = (fn: () => void): void => {
+          if (settled) {
+            return
           }
-          reject(new Error(message))
-        })
-      }
+          settled = true
+          cleanup()
+          fn()
+        }
 
-      const onStdout = (chunk: Buffer): void => {
-        buffered += chunk.toString('utf8')
-        const match = READY_PATTERN.exec(buffered)
-        if (match?.[1] === undefined) {
-          // 只保留尾部一段，防止长时间无匹配时无限增长。
-          if (buffered.length > 8_192) {
-            buffered = buffered.slice(-4_096)
+        const fail = (message: string): void => {
+          settle(() => {
+            this.child = undefined
+            // ⚠️ 必须是**进程树** —— 只 `child.kill()` 会留下 magpie 派生的
+            //    孙进程占着端口，下一次 `ensure()` 再 spawn 一份，越积越多。
+            stopProcessTree(child)
+            reject(new Error(message))
+          })
+        }
+
+        const onStdout = (chunk: Buffer): void => {
+          buffered += chunk.toString('utf8')
+          const match = READY_PATTERN.exec(buffered)
+          if (match?.[1] === undefined) {
+            // 只保留尾部一段，防止长时间无匹配时无限增长。
+            if (buffered.length > 8_192) {
+              buffered = buffered.slice(-4_096)
+            }
+            return
           }
-          return
+          settle(() => {
+            logger.debug(`[magpie] magpie web 就绪：${match[0]}`)
+            resolve()
+          })
         }
-        const url = match[1]
-        settle(() => {
-          logger.debug(`[magpie] magpie web 就绪：${url}`)
-          resolve(url)
-        })
-      }
 
-      const onStderr = (chunk: Buffer): void => {
-        const text = chunk.toString('utf8').trim()
-        if (text.length > 0) {
-          logger.debug(`[magpie] magpie web stderr: ${text.slice(0, 500)}`)
+        const onStderr = (chunk: Buffer): void => {
+          const text = chunk.toString('utf8').trim()
+          if (text.length > 0) {
+            logger.debug(`[magpie] magpie web stderr: ${text.slice(0, 500)}`)
+          }
+        }
+
+        const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+          fail(
+            `magpie web 提前退出（code=${String(code)}, signal=${String(signal)}）` +
+              (buffered.length > 0 ? `：${buffered.slice(-400)}` : ''),
+          )
+        }
+
+        const onError = (error: Error): void => {
+          fail(`无法启动 magpie web：${error.message}`)
+        }
+
+        const timer = setTimeout(() => {
+          fail(`magpie web 在 ${String(timeoutMs)}ms 内没有就绪`)
+        }, timeoutMs)
+        // 超时定时器不该把进程吊住（Node 默认 30 秒就够，但显式一些更安全）。
+        timer.unref?.()
+
+        child.stdout?.on('data', onStdout)
+        child.stderr?.on('data', onStderr)
+        child.once('exit', onExit)
+        child.once('error', onError)
+      })
+
+      guard()
+
+      // 登录拿 cookie。magpie 的认证是 cookie 而不是每次带 key，所以这里
+      // 只做一次，之后全部由代理注入。
+      const cookie = await login(`http://${host}:${String(upstreamPort)}`, key, timeoutMs)
+      guard()
+      logger.debug(`[magpie] 已取得登录 cookie（${cookie.split('=')[0] ?? '?'}）`)
+
+      const started = await startProxy(host, upstreamPort, cookie, host, logger)
+      proxy = started.server
+      this.proxy = proxy
+      guard()
+
+      const url = `http://${host}:${String(started.port)}/`
+      const handle: MagpieWebHandle = {
+        url,
+        port: started.port,
+        upstreamPort,
+        pid: child.pid,
+      }
+      this.handle = handle
+      logger.debug(`[magpie] 代理就绪：${url} → ${host}:${String(upstreamPort)}`)
+      return handle
+    } catch (error) {
+      // 启动失败或插件已卸载：把这一轮建起来的资源全部收掉，不留残留。
+      if (proxy !== undefined) {
+        try {
+          proxy.closeAllConnections?.()
+          proxy.close()
+        } catch {
+          /* 已经关了 */
+        }
+        if (this.proxy === proxy) {
+          this.proxy = undefined
         }
       }
-
-      const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
-        fail(
-          `magpie web 提前退出（code=${String(code)}, signal=${String(signal)}）` +
-            (buffered.length > 0 ? `：${buffered.slice(-400)}` : ''),
-        )
+      stopProcessTree(child)
+      if (this.child === child) {
+        this.child = undefined
       }
-
-      const onError = (error: Error): void => {
-        fail(`无法启动 magpie web：${error.message}`)
-      }
-
-      const timer = setTimeout(() => {
-        fail(`magpie web 在 ${String(timeoutMs)}ms 内没有就绪`)
-      }, timeoutMs)
-      // 超时定时器不该把进程吊住（Node 默认 30 秒就够，但显式一些更安全）。
-      timer.unref?.()
-
-      child.stdout?.on('data', onStdout)
-      child.stderr?.on('data', onStderr)
-      child.once('exit', onExit)
-      child.once('error', onError)
-    })
-
-    // 登录拿 cookie。magpie 的认证是 cookie 而不是每次带 key，所以这里
-    // 只做一次，之后全部由代理注入。
-    const cookie = await login(`http://${host}:${String(upstreamPort)}`, key, timeoutMs)
-    logger.debug(`[magpie] 已取得登录 cookie（${cookie.split('=')[0] ?? '?'}）`)
-
-    const { server, port } = await startProxy(host, upstreamPort, cookie, host, logger)
-    this.proxy = server
-
-    const url = `http://${host}:${String(port)}/`
-    const handle: MagpieWebHandle = { url, port, upstreamPort, pid: child.pid }
-    this.handle = handle
-    logger.debug(`[magpie] 代理就绪：${url} → ${host}:${String(upstreamPort)}`)
-    return handle
+      this.handle = undefined
+      throw error
+    }
   }
 }

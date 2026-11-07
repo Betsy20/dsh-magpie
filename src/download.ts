@@ -64,6 +64,13 @@ export interface EnsureBinaryOptions {
   readonly version?: string
   /** 强制重下（忽略已有文件）。 */
   readonly force?: boolean
+  /**
+   * 取消信号。
+   *
+   * 插件卸载时必须能中断下载 —— 69 MB 在慢网下要几分钟，不中断的话
+   * DSH 退出后还有一个进程在往 `~/.dsh/magpie/bin/` 里写文件。
+   */
+  readonly signal?: AbortSignal
 }
 
 /** {@link ensureMagpieBinary} 的产出。 */
@@ -124,6 +131,7 @@ export async function installedVersion(): Promise<string | undefined> {
  */
 async function resolveLatestRelease(
   logger: DownloadLogger,
+  signal?: AbortSignal,
 ): Promise<{ version: string; assets: readonly ReleaseAsset[] } | undefined> {
   try {
     const response = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
@@ -131,7 +139,12 @@ async function resolveLatestRelease(
         accept: 'application/vnd.github+json',
         'user-agent': 'dsh-magpie',
       },
-      signal: AbortSignal.timeout(30_000),
+      // 同时受「30 秒超时」和「插件卸载」两个信号控制 —— `AbortSignal.any`
+      // 任一触发就中断（Node 20+ 提供）。
+      signal:
+        signal === undefined
+          ? AbortSignal.timeout(30_000)
+          : AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
     })
     if (!response.ok) {
       logger.warn(`[magpie] 查询最新版本失败：HTTP ${String(response.status)}`)
@@ -219,7 +232,7 @@ async function writeStream(
 export async function ensureMagpieBinary(
   options: EnsureBinaryOptions,
 ): Promise<EnsureBinaryResult> {
-  const { logger, force = false } = options
+  const { logger, force = false, signal } = options
   const assetName = releaseAssetName()
   if (assetName === undefined) {
     throw new Error(
@@ -238,7 +251,7 @@ export async function ensureMagpieBinary(
     return { path: destination, version, downloaded: false }
   }
 
-  const release = await resolveLatestRelease(logger)
+  const release = await resolveLatestRelease(logger, signal)
   if (release === undefined) {
     throw new Error(
       '拿不到 magpie 的最新版本（GitHub 不可达）。' +
@@ -265,7 +278,11 @@ export async function ensureMagpieBinary(
     const response = await fetch(asset.url, {
       headers: { 'user-agent': 'dsh-magpie' },
       redirect: 'follow',
-      signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+      // 同 resolveLatestRelease：超时与卸载任一触发都中断。
+      signal:
+        signal === undefined
+          ? AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS)
+          : AbortSignal.any([signal, AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS)]),
     })
     if (!response.ok) {
       throw new Error(`下载失败：HTTP ${String(response.status)} ${response.statusText}`)
@@ -285,7 +302,19 @@ export async function ensureMagpieBinary(
     )
   }
 
-  await rename(partPath, destination)
+  try {
+    // Windows 上 `rename` 到**已存在**的目标会抛 `EEXIST`（POSIX 是静默
+    // 覆盖）。强制重下时先删旧的，否则用户永远卡在「下载完成但没生效」。
+    await rm(destination, { force: true })
+    await rename(partPath, destination)
+  } catch (error) {
+    await rm(partPath, { force: true }).catch(() => undefined)
+    throw new Error(
+      `把下载好的文件挪到 ${destination} 失败：${
+        error instanceof Error ? error.message : String(error)
+      }。请检查磁盘空间与文件权限。`,
+    )
+  }
   if (process.platform !== 'win32') {
     await chmod(destination, 0o755)
   }

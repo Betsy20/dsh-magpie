@@ -37,9 +37,6 @@ interface HelloBody {
 /** 单次探测的默认超时。本机环回，2 秒已经很宽松。 */
 const DEFAULT_PROBE_TIMEOUT_MS = 2_000
 
-/** 轮询等待的默认间隔。 */
-const DEFAULT_POLL_INTERVAL_MS = 250
-
 /**
  * 探测一次网关是否在线。
  *
@@ -75,52 +72,5 @@ export async function probeGateway(
   } catch {
     // 超时 / 连接被拒 / DNS 失败 / 响应不是 JSON —— 全归「不可用」。
     return { reachable: false, version: undefined }
-  }
-}
-
-/**
- * 轮询等待网关上线。
- *
- * 用于「刚 spawn 了 `magpie serve`，等它真的能服务请求」这个场景。为什么
- * 不用 stdout 判断就绪：`magpie serve` 的 `● magpie gateway on …` 那一行
- * 打印时监听器可能还没 accept 第一个连接（实测有几十毫秒的窗口），直接发
- * 请求会偶发 `ECONNREFUSED`。轮询到真能应答为止才是可靠的。
- *
- * @param baseURL - 网关根地址。
- * @param timeoutMs - 总超时。
- * @param intervalMs - 轮询间隔。
- * @param signal - 外部取消信号（面板关闭时别继续等）。
- * @returns 最后一次探测的结果（超时则是 `{ reachable: false }`）。
- */
-export async function waitForGateway(
-  baseURL: string,
-  timeoutMs: number,
-  intervalMs: number = DEFAULT_POLL_INTERVAL_MS,
-  signal?: AbortSignal,
-): Promise<GatewayProbe> {
-  const deadline = Date.now() + timeoutMs
-  for (;;) {
-    const probe = await probeGateway(baseURL)
-    if (probe.reachable) {
-      return probe
-    }
-    if (signal?.aborted === true) {
-      return { reachable: false, version: undefined }
-    }
-    if (Date.now() >= deadline) {
-      return probe
-    }
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, intervalMs)
-      // 取消时提前唤醒，别让调用方多等一个 interval。
-      signal?.addEventListener(
-        'abort',
-        () => {
-          clearTimeout(timer)
-          resolve()
-        },
-        { once: true },
-      )
-    })
   }
 }

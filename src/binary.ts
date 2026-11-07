@@ -120,11 +120,20 @@ export function systemBinaryCandidates(platform = osPlatform()): readonly string
   ]
 }
 
-/** `PATH` 里所有目录（`undefined` 条目已剔除）。 */
-function pathEntries(): readonly string[] {
+/**
+ * `PATH` 里所有目录（`undefined` 条目已剔除）。
+ *
+ * ⚠️ 分隔符必须跟着**参数** `platform` 走，不能用 `process.platform` ——
+ * 否则测试在 Linux CI 上跑 Windows 分支时会按 `:` 切 `C:\foo;D:\bar`，
+ * 得到一堆无效路径。
+ *
+ * @param platform - 目标平台；默认当前平台。
+ * @returns 目录绝对路径数组。
+ */
+function pathEntries(platform = osPlatform()): readonly string[] {
   const raw = process.env['PATH'] ?? process.env['Path'] ?? ''
   return raw
-    .split(process.platform === 'win32' ? ';' : ':')
+    .split(platform === 'win32' ? ';' : ':')
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0)
 }

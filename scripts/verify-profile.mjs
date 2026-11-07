@@ -13,7 +13,6 @@
  * - 包名拼错 / 没做 junction → `ERR_MODULE_NOT_FOUND`
  * - 忘了 `export const name` → 宿主以空 inject 激活，首次读服务抛
  *   `cannot get property ... without inject`
- * - 两个插件抢同一个 provider id → `DUPLICATE_ADAPTER`
  * - 同一段配置被写了两份（一次注释一次没注释）→ 看起来「改好了」其实没改
  * - `Config` 不是 schemastery → 所有依赖 settings 的界面全挂
  *
@@ -133,7 +132,6 @@ for (const entry of entries) {
     failures.push(`${label}: 重复 insert（同一包在 ${seenNames.get(entry.name)} 与 ${entry.id} 各注册一次）`)
     continue
   }
-  seenNames.set(entry.name, entry.id)
 
   let mod
   try {
@@ -143,9 +141,21 @@ for (const entry of entries) {
     const entryPath = join(profileDir, 'node_modules', entry.name, mainRelative)
     mod = await import(pathToFileURL(entryPath).href)
   } catch (error) {
+    // `@deepseek-ai/*` 是 DSH **自带**的包（打包在 `app.asar` 里），profile
+    // 的 `node_modules` 下根本没有 —— 宿主自己解析得到，不算装配问题。
+    // 不跳过的话，第一个 MCP 条目会 ENOENT，后面同名的全部被判「重复
+    // insert」，报出一串级联假象。
+    if (entry.name.startsWith('@deepseek-ai/') && error?.code === 'ENOENT') {
+      console.log(`  ⏭️  ${label}（宿主内置，跳过）`)
+      continue
+    }
     failures.push(`${label}: 无法加载 → ${error instanceof Error ? error.message : String(error)}`)
     continue
   }
+
+  // ⚠️ 只有**加载成功**才记进 seenNames —— 否则第一个 ENOENT 会把后面
+  //    同名的合法条目全部误判成「重复 insert」。
+  seenNames.set(entry.name, entry.id)
 
   const problems = []
   // 宿主契约：必须有 name / inject / apply 三个具名导出。
@@ -170,12 +180,6 @@ for (const entry of entries) {
 
 // 残留检查：注释掉的 llm-pi-ai 不该再出现在生效树里。
 console.log('')
-const livePiAi = /^- id: llm-pi-ai\b/m.test(patchText)
-if (livePiAi) {
-  failures.push('llm-pi-ai 的 insert 仍然生效 —— 它会与 dsh-magpie 抢同一个 provider id（DUPLICATE_ADAPTER）')
-} else {
-  console.log('  ✅ llm-pi-ai 已注释掉，magpie provider 归 dsh-magpie 独占')
-}
 const commentedPiAiCount = (patchText.match(/^# - id: llm-pi-ai\b/gm) ?? []).length
 if (commentedPiAiCount > 1) {
   failures.push(`llm-pi-ai 的注释副本有 ${commentedPiAiCount} 份 —— 手工改配置时容易只改一份，剩下一份看着像已停用其实没停用`)

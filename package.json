@@ -1,14 +1,13 @@
 {
   "name": "dsh-magpie",
   "version": "0.1.0",
-  "description": "Magpie gateway provider for DeepSeek Harness: dynamic model catalogue, streaming chat with reasoning and tool calls, and a control panel for quotas, usage and routing groups.",
+  "description": "把 magpie 原版 Web UI 嵌进 DSH 侧边栏；缺 magpie 时自动下载，缺网关时自动启动",
   "keywords": [
     "deepseek-harness",
     "dsh",
     "dsh-plugin",
     "magpie",
     "llm",
-    "provider",
     "openai-compatible"
   ],
   "type": "module",
