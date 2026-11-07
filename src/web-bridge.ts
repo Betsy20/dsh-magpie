@@ -197,65 +197,51 @@ const INJECTED_HTML_SCRIPT = `<script>
   /**
    * 把 \`window/*\` 这类「桌面窗口控制」的 RPC 转成宿主消息。
    *
-   * ## 为什么包装 \`api()\` 而不是逐个拦按钮
+   * ## ⚠️ 为什么 hook \`fetch()\` 而不是包装 \`api()\`
    *
-   * 需要接管的按钮散落在三个文件里，**大多数没有稳定的 id**：
+   * \`api()\` 是 \`app.js\` 里的**顶层函数声明**（\`async function api(path, body,
+   * heads, signal)\`，第 114 行），所有调用点（\`openSettings()\` 等）直接写
+   * \`api(...)\` —— 那是**词法作用域**查找，根本不经过 \`window.api\` 属性。
+   * 赋值 \`window.api = wrapped\` 对它们**完全无效**。
+   *
+   * 但 \`api()\` 内部最终走 \`await fetch("/api/" + path, ...)\` —— **全局
+   * fetch**。hook 这一层，所有 \`api()\` 调用都会被拦到，包括以后 magpie
+   * 新加的按钮。
+   *
+   * ## 为什么要接管的按钮没一个有稳定 id
+   *
    * - \`app.js\` 的 \`#openMain\`（打开主窗口）、\`#prefs\`（设置）、\`#quit\`（退出）
    * - \`app.js\` 里 \`renderPanelUse\` 动态造的「打开用量」按钮
    * - \`plugins/routing/client.js\` 动态造的「打开路由」按钮
    *
-   * 后两个连 id 都没有，只能靠文本（会随语言变）—— 但它们
-   * **唯一共同点**是都调 \`api("window/...", {})\`，而浏览器里没有
-   * \`/api/window/*\` 这个端点。包装这一层，所有入口一起接管，
-   * 以后 magpie 加新按钮也自动生效。
-   *
-   * \`web\` 为真时 \`api("open")\` 已经走 \`window.open\`（真的开系统浏览器），
-   * 那条路径不拦 —— 那是外部链接，不是窗口控制。
+   * 后两个连 id 都没有，只能靠文本匹配（会随语言变）。它们**唯一共同点**
+   * 是都调 \`api("window/...", {})\` —— 而浏览器里没有 \`/api/window/*\` 这个
+   * 端点（那是 Wails 的私有通道）。
    */
-  var wrapApi = function () {
-    if (typeof window.api !== "function" || window.api.__dshWrapped) return false;
-    var original = window.api;
-    var wrapped = function (path, body, heads, signal) {
-      if (typeof path !== "string" || path.indexOf("window/") !== 0) {
-        return original.apply(this, arguments);
-      }
-      var query = path.indexOf("?") >= 0 ? path.slice(path.indexOf("?") + 1) : "";
-      var params = new URLSearchParams(query);
-      var action = path.slice("window/".length).split("?")[0];
-      try {
-        window.parent.postMessage({
-          source: "dsh-magpie",
-          kind: action,
-          view: params.get("view") || "",
-          tab: params.get("tab") || ""
-        }, parentOrigin);
-      } catch (e) {}
-      // 原语义是 async RPC —— 调用方会 \`await\`。返回 resolved Promise
-      // 比 \`undefined\` 更贴近（有些调用点会 \`.then()\`）。
-      return Promise.resolve(null);
-    };
-    wrapped.__dshWrapped = true;
-    window.api = wrapped;
-    return true;
+  var originalFetch = window.fetch;
+  window.fetch = function (input, init) {
+    var url = typeof input === "string" ? input : (input && input.url) || "";
+    var prefix = "/api/window/";
+    var at = url.indexOf(prefix);
+    if (at < 0) {
+      return originalFetch.apply(this, arguments);
+    }
+    var rest = url.slice(at + prefix.length);
+    var q = rest.indexOf("?");
+    var action = q >= 0 ? rest.slice(0, q) : rest;
+    var params = new URLSearchParams(q >= 0 ? rest.slice(q + 1) : "");
+    try {
+      window.parent.postMessage({
+        source: "dsh-magpie",
+        kind: action,
+        view: params.get("view") || "",
+        tab: params.get("tab") || ""
+      }, parentOrigin);
+    } catch (e) {}
+    // \`api()\` 对 204 直接 \`return null\`（见 app.js 的 \`if (res.status === 204)
+    // return null;\`）—— 正是我们要的「这个 RPC 已经处理过了」语义。
+    return Promise.resolve(new Response(null, { status: 204 }));
   };
-  // \`app.js\` 可能还没执行到（我们的 script 在 \`</body>\` 前，而 \`api()\`
-  // 是它里面的顶层声明）—— 轮询到它出现为止。
-  //
-  // ⚠️ 用**指数退避**而不是固定 50ms：固定间隔的最长 5 秒上限在慢机器
-  //    首次加载时不够（69 MB 二进制解压 + 磁盘慢），超时后按钮就永远
-  //    没反应了。退避总时长约 30 秒，间隔封顶 1 秒，不会烧 CPU。
-  var scheduleWrap = function () {
-    var tries = 0;
-    var tick = function () {
-      if (wrapApi()) return;
-      tries += 1;
-      if (tries > 40) return;
-      var delay = Math.min(50 * Math.pow(2, tries), 1_000);
-      setTimeout(tick, delay);
-    };
-    tick();
-  };
-  if (!wrapApi()) scheduleWrap();
 
   // 完整页面：接收宿主的「切到某页」指令。
   if (!isPanel) {
