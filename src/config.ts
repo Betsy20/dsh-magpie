@@ -7,7 +7,7 @@
  * 传入裸函数（`(value) => ...`）会让它抛
  * `TypeError: ... .toJSON is not a function`，进而使**所有**依赖 settings 的界面
  * （模型设置页、sidebar 的 `settings.get` / `shell.get`）全部失败 ——
- * 一个 provider 插件的配置写法能拖垮整个设置面。
+ * 一个插件的配置写法能拖垮整个设置面。
  *
  * ## 字段的可写性
  *
@@ -19,53 +19,25 @@
  */
 
 import Schema from '@deepseek-ai/schemastery'
-import { API_KEY_ENV, DEFAULT_API_KEY, DEFAULT_BASE_URL } from './product.js'
+import { DEFAULT_BASE_URL } from './product.js'
 
 /** 插件配置的**归一化后**形态（所有字段都有值）。 */
 export interface MagpieOptions {
-  /** 网关根地址，**不带** `/v1`（本插件自己拼路径）。 */
+  /** 网关根地址，**不带** `/v1`。 */
   readonly baseURL: string
-  /**
-   * 直接写死的 API key。留空时按 {@link apiKeyEnv} 读环境变量，
-   * 再退到 magpie 出厂值 `magpie`。
-   */
-  readonly apiKey: string
-  /** 读取 API key 的环境变量名。 */
-  readonly apiKeyEnv: string
-  /** 非流式请求（目录、额度、用量）的超时，毫秒。 */
-  readonly requestTimeoutMs: number
-  /** 流式请求的**空闲**超时（两个 chunk 之间的最长间隔），毫秒。 */
-  readonly streamIdleTimeoutMs: number
-  /** 模型目录缓存存活时间，毫秒。0 表示每次都重新拉。 */
-  readonly catalogTtlMs: number
-  /** 模型 id 白名单（glob）。非空时**只有**命中的模型进目录。 */
-  readonly modelInclude: readonly string[]
-  /** 模型 id 黑名单（glob）。命中的模型不进目录（白名单优先于黑名单）。 */
-  readonly modelExclude: readonly string[]
-  /** 是否把 magpie 标记为「已在 Jet Hub 关闭」的模型也放进目录。 */
-  readonly includeDisabledModels: boolean
-  /**
-   * 是否给每个请求带上 `X-Magpie-Session`。
-   *
-   * magpie 用这个 header 做**会话粘性路由**（同一个会话固定打同一个上游账号，
-   * 提升 prompt cache 命中率）。DSH 的 `GenerateOptions.sessionId` 是
-   * Agent 生命周期内的稳定身份，正好可以映射过去。
-   */
-  readonly sessionHeader: boolean
   /**
    * 是否在面板里嵌入 magpie **原版** Web UI。
    *
    * 见 `web-bridge.ts` 的长注释：官方 `magpie web` 把整个 App 窗口用 HTTP
    * 提供出来，本插件用 iframe 原样嵌入，而不是自造一套摹本页签。
-   * 关掉后只剩模型选择能力，没有一个可看的界面。
    */
   readonly webEnabled: boolean
   /**
    * 插件加载时是否自动拉起网关。
    *
    * 为什么需要这个：插件一开始假设「网关已经在跑」，但用户装完插件第一次
-   * 打开 DSH 时网关通常没起 —— 模型选择器是空的，面板一片红。让用户自己
-   * 去开 magpie 是没必要的摩擦。
+   * 打开 DSH 时网关通常没起 —— 面板一片红。让用户自己去开 magpie 是
+   * 没必要的摩擦。
    *
    * 打开后，`apply()` 会在后台起一个 `magpie serve --web=<port>` 进程
    * （**一个进程同时提供网关和 Web UI**），插件卸载时连进程树一起收掉。
@@ -98,29 +70,9 @@ export interface MagpieOptions {
   readonly webKey: string
 }
 
-/**
- * 出厂默认值。
- *
- * ⚠️ 这里的数字都是**实测**得出的，不是拍脑袋：
- * - `requestTimeoutMs: 10_000` —— 本机 `GET /v1/models` 首字节 ~50ms，
- *   10 秒足够覆盖冷启动与上游抖动；再长会让「网关没跑」的判定拖到用户放弃。
- * - `streamIdleTimeoutMs: 600_000` —— 与既有 `llm-pi-ai` 配置里的
- *   `streamIdleTimeoutMs` 同值。深度思考模型在长上下文下首次出 token 可能
- *   超过 60 秒（实测 `reasoning_effort: max` 时有 3 分钟量级的样本）。
- * - `catalogTtlMs: 60_000` —— 目录变化不频繁，一分钟的陈旧窗口可接受，
- *   同时避免每次打开模型选择器都打一次网关卡。
- */
+/** 出厂默认值。 */
 export const DEFAULT_OPTIONS: MagpieOptions = Object.freeze({
   baseURL: DEFAULT_BASE_URL,
-  apiKey: '',
-  apiKeyEnv: API_KEY_ENV,
-  requestTimeoutMs: 10_000,
-  streamIdleTimeoutMs: 600_000,
-  catalogTtlMs: 60_000,
-  modelInclude: Object.freeze([]),
-  modelExclude: Object.freeze([]),
-  includeDisabledModels: true,
-  sessionHeader: true,
   webEnabled: true,
   autoStartGateway: true,
   autoDownloadMagpie: true,
@@ -142,52 +94,6 @@ export const Config = Schema.object({
   baseURL: Schema.string()
     .default(DEFAULT_BASE_URL)
     .description('Magpie 网关根地址，不带 /v1。默认 http://127.0.0.1:3425')
-    .volatile(),
-
-  apiKey: Schema.string()
-    .default('')
-    .description('直接写死的网关 key。留空则读下面的环境变量，再退到 magpie 出厂值。')
-    .role('secret')
-    .volatile(),
-
-  apiKeyEnv: Schema.string()
-    .default(API_KEY_ENV)
-    .description('读取网关 key 的环境变量名（~/.dsh/.env 里配 MAGPIE_GATEWAY_KEY=magpie）')
-    .volatile(),
-
-  requestTimeoutMs: Schema.number()
-    .default(10_000)
-    .description('非流式请求超时（毫秒）：模型目录、额度、用量')
-    .volatile(),
-
-  streamIdleTimeoutMs: Schema.number()
-    .default(600_000)
-    .description('流式请求空闲超时（毫秒）：两个 chunk 之间的最长间隔')
-    .volatile(),
-
-  catalogTtlMs: Schema.number()
-    .default(60_000)
-    .description('模型目录缓存存活时间（毫秒）。0 表示每次都重新拉')
-    .volatile(),
-
-  modelInclude: Schema.array(Schema.string())
-    .default([])
-    .description('模型 id 白名单（glob）。非空时只有命中的模型进目录')
-    .volatile(),
-
-  modelExclude: Schema.array(Schema.string())
-    .default([])
-    .description('模型 id 黑名单（glob）。命中的模型不进目录；白名单优先')
-    .volatile(),
-
-  includeDisabledModels: Schema.boolean()
-    .default(true)
-    .description('是否收录 magpie 标记为「已在 Jet Hub 关闭」的模型')
-    .volatile(),
-
-  sessionHeader: Schema.boolean()
-    .default(true)
-    .description('是否发送 X-Magpie-Session（会话粘性路由，提升 prompt cache 命中率）')
     .volatile(),
 
   webEnabled: Schema.boolean()
@@ -244,37 +150,20 @@ export function resolveOptions(config: unknown): MagpieOptions {
     const value = raw[key]
     return typeof value === 'string' && value.trim().length > 0 ? value.trim() : fallback
   }
-  const positiveNumber = (key: keyof MagpieOptions, fallback: number, allowZero = false): number => {
+  const positiveNumber = (key: keyof MagpieOptions, fallback: number): number => {
     const value = raw[key]
     if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
-    if (value < 0) return fallback
-    if (value === 0 && !allowZero) return fallback
+    if (value <= 0) return fallback
     return Math.floor(value)
   }
   const boolean = (key: keyof MagpieOptions, fallback: boolean): boolean => {
     const value = raw[key]
     return typeof value === 'boolean' ? value : fallback
   }
-  const stringList = (key: keyof MagpieOptions, fallback: readonly string[]): readonly string[] => {
-    const value = raw[key]
-    if (!Array.isArray(value)) return fallback
-    const items = value.filter((item): item is string => typeof item === 'string' && item.length > 0)
-    return Object.freeze(items)
-  }
 
   return Object.freeze({
     // 去掉尾部斜杠：`baseURL + '/v1/models'` 否则会拼出 `//v1/models`。
-    // 绝大多数网关容忍双斜杠，但 magpie 的路由是精确匹配，不容忍。
     baseURL: trimTrailingSlash(string('baseURL', DEFAULT_OPTIONS.baseURL)),
-    apiKey: string('apiKey', ''),
-    apiKeyEnv: string('apiKeyEnv', DEFAULT_OPTIONS.apiKeyEnv),
-    requestTimeoutMs: positiveNumber('requestTimeoutMs', DEFAULT_OPTIONS.requestTimeoutMs),
-    streamIdleTimeoutMs: positiveNumber('streamIdleTimeoutMs', DEFAULT_OPTIONS.streamIdleTimeoutMs),
-    catalogTtlMs: positiveNumber('catalogTtlMs', DEFAULT_OPTIONS.catalogTtlMs, true),
-    modelInclude: stringList('modelInclude', DEFAULT_OPTIONS.modelInclude),
-    modelExclude: stringList('modelExclude', DEFAULT_OPTIONS.modelExclude),
-    includeDisabledModels: boolean('includeDisabledModels', DEFAULT_OPTIONS.includeDisabledModels),
-    sessionHeader: boolean('sessionHeader', DEFAULT_OPTIONS.sessionHeader),
     webEnabled: boolean('webEnabled', DEFAULT_OPTIONS.webEnabled),
     autoStartGateway: boolean('autoStartGateway', DEFAULT_OPTIONS.autoStartGateway),
     autoDownloadMagpie: boolean('autoDownloadMagpie', DEFAULT_OPTIONS.autoDownloadMagpie),
@@ -283,26 +172,6 @@ export function resolveOptions(config: unknown): MagpieOptions {
     webPort: positiveNumber('webPort', DEFAULT_OPTIONS.webPort),
     webKey: string('webKey', DEFAULT_OPTIONS.webKey),
   })
-}
-
-/**
- * 解析出实际使用的 API key。
- *
- * 优先级：配置里的 `apiKey` → 环境变量 `apiKeyEnv` → 出厂值 `magpie`。
- *
- * ⚠️ **不能因为环境变量缺失就抛错**：magpie 的出厂 key 就是字面量
- * `magpie`，本机 `~/.dsh/.env` 也正是这么配的（`MAGPIE_GATEWAY_KEY=magpie`）。
- * 在「网关本身不校验强 key」的部署里抛错只会让插件无法启动，
- * 而真正的鉴权失败会在第一次请求时给出准确报错。
- *
- * @param options - 归一化后的选项。
- * @returns 可直接放进 `Authorization: Bearer <key>` 的字符串。
- */
-export function resolveApiKey(options: MagpieOptions): string {
-  if (options.apiKey.length > 0) return options.apiKey
-  const fromEnv = process.env[options.apiKeyEnv]
-  if (typeof fromEnv === 'string' && fromEnv.trim().length > 0) return fromEnv.trim()
-  return DEFAULT_API_KEY
 }
 
 /**

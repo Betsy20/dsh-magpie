@@ -35,19 +35,11 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-// ⚠️ schemastery 是 **default 导出**（`export default Schema`），不是命名导出。
-//    写成 `import { Schema }` 会得到 `TS2614: has no exported member 'Schema'`，
-//    而由于它只是**类型**层面失败（运行时 `undefined`），忘记看 tsc 输出的话
-//    会在插件激活时以 `Schema is not a function` 崩在 profile 启动阶段。
-import Schema from '@deepseek-ai/schemastery'
 
-import { ModelCatalog } from './catalog.js'
-import { MagpieAdminClient, toSnapshotModel, type SnapshotModel } from './admin.js'
-import { resolveApiKey, resolveOptions, type MagpieOptions } from './config.js'
+import { resolveOptions, type MagpieOptions } from './config.js'
 import { describeSource, resolveMagpieBinary } from './binary.js'
 import { ensureMagpieBinary } from './download.js'
 import { LOG_PREFIX } from './product.js'
-import type { RequestContext } from './http.js'
 import { MagpieWebBridge } from './web-bridge.js'
 
 /** 面板 RPC 的 HTTP 路径（POST）。 */
@@ -59,61 +51,10 @@ const PANEL_ENDPOINT = 'magpie'
 /**
  * 插件 Config schema。
  *
- * ⚠️ **必须是 schemastery schema**：`SettingsForms.describe()` 会对每一项调
- * `schema.toJSON()`，传裸函数（`(value) => ...`）会让它抛
- * `TypeError: … .toJSON is not a function`，进而使**所有**依赖 settings 的
- * 界面（模型设置页、sidebar 的 settings.get/shell.get）全部失败。
- *
- * ⚠️ `.volatile()` 只能加在**字段**上，**不能**加在顶层 `Schema.object(...)`：
- * `SchemaOutput<T, M> = M extends 'volatile' ? Volatile<T | undefined> : …`，
- * 加在顶层会让 `config.baseURL` 直接报 `Property 'baseURL' does not exist on
- * type 'Volatile<…> | undefined'`。
- *
- * 字段语义见 {@link MagpieOptions}。
+ * 定义在 `config.ts`（唯一真相源）—— 这里只做**重新导出**，因为 cordis
+ * 从插件入口模块取 `Config`。
  */
-export const Config = Schema.object({
-  baseURL: Schema.string()
-    .description('magpie 网关地址（默认 http://127.0.0.1:3425）')
-    .default('http://127.0.0.1:3425')
-    .volatile(),
-  apiKey: Schema.string()
-    .description('网关 API key；留空则读环境变量 MAGPIE_GATEWAY_KEY，再退回 "magpie"')
-    .role('secret')
-    .default('')
-    .volatile(),
-  apiKeyEnv: Schema.string()
-    .description('apiKey 为空时要读的环境变量名')
-    .default('MAGPIE_GATEWAY_KEY')
-    .volatile(),
-  requestTimeoutMs: Schema.number()
-    .description('模型目录 / 管理 API 的单次请求超时（毫秒）')
-    .default(10_000)
-    .volatile(),
-  streamIdleTimeoutMs: Schema.number()
-    .description('流式响应的空闲超时（毫秒）；深度思考模型长推理时不要调得太小')
-    .default(600_000)
-    .volatile(),
-  catalogTtlMs: Schema.number()
-    .description('模型目录缓存有效期（毫秒）')
-    .default(60_000)
-    .volatile(),
-  modelInclude: Schema.array(Schema.string())
-    .description('只暴露匹配这些 glob 的模型（空 = 全部）')
-    .default([])
-    .volatile(),
-  modelExclude: Schema.array(Schema.string())
-    .description('隐藏匹配这些 glob 的模型')
-    .default([])
-    .volatile(),
-  includeDisabledModels: Schema.boolean()
-    .description('是否暴露已在 Jet Hub 关闭的模型')
-    .default(true)
-    .volatile(),
-  sessionHeader: Schema.boolean()
-    .description('是否把 DSH 会话 id 通过 X-Magpie-Session 头传给网关')
-    .default(true)
-    .volatile(),
-})
+export { Config } from './config.js'
 
 /** cordis 条目 id。**必须**与 `package.json` 的 `name` 及 `cordis.patch.yml` 的 `name` 一致。 */
 export const name = 'magpie'
@@ -169,42 +110,6 @@ function makeLogger(ctx: Context): { debug(message: string): void; warn(message:
 }
 
 /**
- * 构造请求上下文（管理面与对话面共用同一套头）。
- *
- * @param options - 已解析的配置。
- * @param sessionId - 当前 DSH 会话 id（可空）。
- * @param signal - 取消信号（可空）。
- * @param logger - 日志接口。
- * @returns 请求上下文。
- */
-function makeContext(
-  options: MagpieOptions,
-  sessionId: string | undefined,
-  signal: AbortSignal | undefined,
-  logger: { warn(message: string): void },
-): RequestContext {
-  return {
-    options,
-    // ⚠️ 必须走 `resolveApiKey`（配置 → 环境变量 → 出厂值三级兜底），
-    //    直接用 `options.apiKey` 会在用户留空时发出 `Bearer ` 空头。
-    apiKey: resolveApiKey(options),
-    ...(sessionId === undefined ? {} : { sessionId }),
-    ...(signal === undefined ? {} : { signal }),
-    logger,
-  }
-}
-
-/**
- * 把目录快照转成面板模型列表。
- *
- * @param models - `ModelCatalog` 给出的模型条目。
- * @returns 面板用的精简结构。
- */
-function toPanelModels(models: readonly unknown[]): SnapshotModel[] {
-  return models.map((raw) => toSnapshotModel(raw as Parameters<typeof toSnapshotModel>[0]))
-}
-
-/**
  * 注册面板 RPC 端点。
  *
  * 协议与 `dsh-providers-hub` 的 Jet Hub 通道一致：
@@ -215,13 +120,12 @@ function toPanelModels(models: readonly unknown[]): SnapshotModel[] {
  * 500 文本 —— 客户端的 `unwrapRpcResult` 只认这个形状，否则表现为「点了没反应」。
  *
  * @param ctx - 插件上下文（已含 connection）。
- * @param catalog - 模型目录。
  * @param options - 已解析配置。
  * @param logger - 日志接口。
+ * @param getBridge - 惰性取的 Web 桥。
  */
 function registerPanelRpc(
   ctx: Context,
-  catalog: ModelCatalog,
   options: MagpieOptions,
   logger: { debug(message: string): void; warn(message: string): void },
   /**
@@ -243,8 +147,6 @@ function registerPanelRpc(
     return
   }
 
-  const admin = new MagpieAdminClient()
-
   /**
    * 分发一个面板方法。
    *
@@ -264,29 +166,6 @@ function registerPanelRpc(
     signal: AbortSignal | undefined,
   ): Promise<unknown> {
     switch (method) {
-      case 'panel.snapshot': {
-        const context = makeContext(options, undefined, signal, logger)
-        const snapshot = await catalog.get()
-        return { ok: true, value: await admin.snapshot(context, toPanelModels(snapshot.models)) }
-      }
-      case 'catalog.refresh': {
-        catalog.invalidate()
-        const snapshot = await catalog.get()
-        return {
-          ok: true,
-          value: {
-            models: toPanelModels(snapshot.models),
-            version: snapshot.gatewayVersion,
-          },
-        }
-      }
-      case 'gateway.version': {
-        const context = makeContext(options, undefined, signal, logger)
-        const hello = await admin.hello(context)
-        return hello.ok
-          ? { ok: true, value: { version: hello.data.version } }
-          : { ok: false, error: hello.error }
-      }
       case 'web.url': {
         // 面板 iframe 的 src。首次调用会 spawn `magpie web`（20–30 秒），
         // 之后走缓存。失败必须是 `{ ok: false, error }` —— 见本函数头注释。
@@ -408,14 +287,6 @@ function registerPanelRpc(
 export function apply(ctx: Context, config?: unknown): void {
   const options = resolveOptions(config)
   const logger = makeLogger(ctx)
-  // `ModelCatalog` 收 **getter** 而不是值 —— 配置热重载（profile 的
-  // `patchReload: "live"`）会重建插件 fiber，但同一 fiber 内也可能被
-  // `catalog.refresh` 等方法重新读取；用 getter 保证「读到的永远是当前值」。
-  const catalog = new ModelCatalog(
-    () => makeContext(options, undefined, undefined, logger),
-    () => options,
-    logger,
-  )
 
   // 原版 Web UI 的进程桥：默认**惰性**启动（第一次 `web.url` 才 spawn），
   // 因此不打开面板时不会平白多一个 magpie 进程。
@@ -520,6 +391,6 @@ export function apply(ctx: Context, config?: unknown): void {
 
   // 面板通道：只有 Web profile 里才存在 connection，其余 profile 安静跳过。
   ctx.inject(['connection'], (connectionCtx) => {
-    registerPanelRpc(connectionCtx as Context, catalog, options, logger, getBridge)
+    registerPanelRpc(connectionCtx as Context, options, logger, getBridge)
   })
 }
