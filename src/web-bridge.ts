@@ -95,6 +95,25 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 30_000
 const DEFAULT_PORT_ATTEMPTS = 24
 
 /**
+ * 代理的默认首选端口。
+ *
+ * 3490 = magpie 默认 web 端口 3480 + 10，避开 magpie 自己向上找端口时
+ * 可能用掉的 3481–3489。**必须固定** —— 见 {@link startProxy} 的
+ * `preferredPort` 参数。
+ */
+const DEFAULT_PROXY_PORT = 3490
+
+/**
+ * `magpie web` 连续异常退出时最多自动重启几次。
+ *
+ * magpie 自我更新（`POST /api/update/install`）时会「新进程起来 → 老进程
+ * 退出」，这算**正常**退出，必须自动拉起，否则代理就永久关着。
+ * 但如果是真的启动即崩（二进制损坏、端口被占、权限问题），无退避的重启
+ * 会变成忙循环 —— 所以连续失败超过这个次数就停下，把错误留在日志里。
+ */
+const MAX_AUTO_RESTARTS = 5
+
+/**
  * 代理转发时必须**丢弃**的请求头。
  *
  * `host` 要换成上游的；`connection` / `content-length` 由 Node 的 http 客户端
@@ -330,6 +349,15 @@ export interface MagpieWebBridgeOptions {
   readonly host: string
   /** 首选端口；被占用时向后找空闲端口。 */
   readonly preferredPort: number
+  /**
+   * 代理（iframe 直接加载的那个）的首选端口；被占用时向后找。
+   *
+   * ⚠️ 代理**必须**监听一个固定端口 —— 不能用 `listen(0)`。
+   * magpie 自己重启（更新、崩溃）时代理会重建，端口随机的话 iframe 的
+   * `src` 就指向一个再也无人监听的端口，页面里所有 `/api/*` 请求全部
+   * `ERR_CONNECTION_REFUSED`。
+   */
+  readonly proxyPort?: number
   /** 启动超时（毫秒）。 */
   readonly startupTimeoutMs?: number
   /**
@@ -498,6 +526,7 @@ async function startProxy(
   cookie: string,
   listenHost: string,
   logger: WebBridgeLogger,
+  preferredPort: number,
 ): Promise<{ server: Server; port: number }> {
   const server = createHttpServer((request, response) => {
     const headers: Record<string, string | string[]> = {}
@@ -716,14 +745,24 @@ async function startProxy(
     upstream.end()
   })
 
-  const port = await new Promise<number>((resolve, reject) => {
+  // ⚠️ **必须用固定端口**（`preferredPort` 起步、被占则递增），
+  //    **不能** `listen(0)` 让系统随机分配。
+  //
+  //    面板 iframe 的 `src` 在渲染时就定下来了；magpie 自己重启（更新、
+  //    崩溃、被安全软件拦）时代理会重建一次。端口若随机，重建后 URL 就变
+  //    了，而 iframe 还是旧的那个 —— 页面里所有 `/api/*` 请求全部
+  //    `ERR_CONNECTION_REFUSED`，用户看到「面板一片白 + 控制台刷红」。
+  //
+  //    固定端口后，magpie 重启只是代理背后换了上游，iframe 的地址不变，
+  //    用户按 Ctrl+R 就能恢复。
+  const port = await findFreePort(listenHost, preferredPort, DEFAULT_PORT_ATTEMPTS)
+  await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
-    server.listen(0, listenHost, () => {
-      const address = server.address()
-      resolve(typeof address === 'object' && address !== null ? address.port : 0)
+    server.listen(port, listenHost, () => {
+      resolve()
     })
   })
-
+  logger.debug(`[magpie] 代理监听 ${listenHost}:${String(port)}`)
   return { server, port }
 }
 
@@ -749,6 +788,116 @@ export function mainWindowUrl(host: string, port: number): string {
 export function dockWindowUrl(host: string, port: number): string {
   // ⚠️ 同 mainWindowUrl —— 过 connectHost。
   return `http://${connectHost(host)}:${String(port)}/?mode=panel`
+}
+
+/**
+ * 清理**孤儿** magpie 进程 —— 只认我们自己的二进制路径。
+ *
+ * ## 为什么必须有
+ *
+ * magpie 自我更新（`POST /api/update/install`）的做法是「用新二进制起一个
+ * 新进程 → 老进程退出」。老进程一退，`child.once('exit')` 里的
+ * `stopProcessTree(child)` 就**什么也杀不到**（PID 已经不存在），而新起的
+ * 那个进程**不在我们的进程树里** —— 于是它变成孤儿，一直占着 348x 端口。
+ *
+ * 一次更新留一个，进程列表会越积越长（实测残留过 5 个）。所以每次启动前
+ * 先按**可执行文件绝对路径**把残留的全清掉。
+ *
+ * ## 为什么按路径而不是 `taskkill /IM magpie.exe`
+ *
+ * 用户可能**自己**装了一份 magpie（`~/AppData/Local/Programs/magpie/`），
+ * 那是他手动在用的，不能杀。我们只清理自己下载到
+ * `~/.dsh/magpie/bin/` 的那份。
+ *
+ * ## 为什么是异步
+ *
+ * PowerShell 冷启动 ~500ms，同步调用会卡住插件激活；而且清理失败也不该
+ * 阻止启动（magpie 自己会向上找空闲端口）。
+ *
+ * @param binaryPath - 我们自己那个 magpie 的绝对路径。
+ * @param logger - 日志。
+ */
+async function reapOrphanMagpies(
+  binaryPath: string,
+  logger: WebBridgeLogger,
+): Promise<void> {
+  // 只有 Windows 需要 —— 其他平台的 magpie 不会 fork 出新进程。
+  if (process.platform !== 'win32') {
+    return
+  }
+
+  // PowerShell 单引号字符串里 `'` 要写成 `''`。
+  const escaped = binaryPath.replace(/'/gu, "''")
+  const script =
+    `Get-CimInstance Win32_Process -Filter "Name='magpie.exe'" ` +
+    `| Where-Object { $_.ExecutablePath -eq '${escaped}' } ` +
+    '| Select-Object -ExpandProperty ProcessId'
+
+  await new Promise<void>((resolve) => {
+    let output = ''
+    let settled = false
+    const finish = (): void => {
+      if (settled) {
+        return
+      }
+      settled = true
+      resolve()
+    }
+
+    let reaper: ChildProcess
+    try {
+      reaper = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      })
+    } catch {
+      // 没有 PowerShell（精简系统）—— 跳过清理，不影响启动。
+      finish()
+      return
+    }
+
+    // 兜底超时：正常 <1s，卡住就是环境不对，别拖累启动。
+    const timer = setTimeout(() => {
+      try {
+        reaper.kill()
+      } catch {
+        /* 已经退出了 */
+      }
+      finish()
+    }, 8_000)
+    timer.unref?.()
+
+    reaper.stdout?.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf8')
+    })
+    reaper.once('error', () => {
+      clearTimeout(timer)
+      finish()
+    })
+    reaper.once('close', () => {
+      clearTimeout(timer)
+      const pids = output
+        .split(/\s+/u)
+        .map((token) => Number.parseInt(token, 10))
+        .filter((pid) => Number.isInteger(pid) && pid > 0)
+      if (pids.length > 0) {
+        logger.debug(
+          `[magpie] 清理 ${String(pids.length)} 个残留 magpie 进程：${pids.join(', ')}`,
+        )
+        for (const pid of pids) {
+          try {
+            spawn('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+              stdio: 'ignore',
+              windowsHide: true,
+            })
+          } catch {
+            /* 已经退出了 */
+          }
+        }
+      }
+      finish()
+    })
+  })
 }
 
 /**
@@ -881,6 +1030,16 @@ export class MagpieWebBridge {
   private generation = 0
 
   /**
+   * 连续自动重启的次数 —— 用来做指数退避。
+   *
+   * 任何一次**成功**启动都会把它清零（见 `ensure()` 的 `.then`）。
+   */
+  private restartAttempts = 0
+
+  /** 挂起的自动重启定时器；`dispose()` 必须清掉，否则卸载后还会拉起进程。 */
+  private restartTimer: NodeJS.Timeout | undefined
+
+  /**
    * @param options - 桥参数。
    */
   constructor(private readonly options: MagpieWebBridgeOptions) {}
@@ -922,6 +1081,12 @@ export class MagpieWebBridge {
    */
   dispose(): void {
     this.disposed = true
+
+    // 先取消挂起的自动重启，否则清理完又会拉起一个新进程。
+    if (this.restartTimer !== undefined) {
+      clearTimeout(this.restartTimer)
+      this.restartTimer = undefined
+    }
 
     // 先关代理，再杀子进程 —— 顺序反了的话，正在转发的请求会先撞上
     // 连接被拒，日志里多出一堆噪声。
@@ -1006,6 +1171,12 @@ export class MagpieWebBridge {
       }
     }
 
+    guard()
+    // 清掉上一轮自我更新留下的孤儿进程（见 {@link reapOrphanMagpies}）。
+    // 放在 `findFreePort` **之前** —— 顺序反了的话，刚探到空闲的端口会被
+    // 随后清理掉的孤儿进程占回去，每次重启端口都往上跳。
+    guard()
+    await reapOrphanMagpies(binary, logger)
     guard()
     const upstreamPort = await findFreePort(host, this.options.preferredPort, DEFAULT_PORT_ATTEMPTS)
     guard()
@@ -1145,7 +1316,14 @@ export class MagpieWebBridge {
       guard()
       logger.debug(`[magpie] 已取得登录 cookie（${cookie.split('=')[0] ?? '?'}）`)
 
-      const started = await startProxy(connectHost(host), upstreamPort, cookie, '127.0.0.1', logger)
+      const started = await startProxy(
+        connectHost(host),
+        upstreamPort,
+        cookie,
+        '127.0.0.1',
+        logger,
+        this.options.proxyPort ?? DEFAULT_PROXY_PORT,
+      )
       proxy = started.server
       this.proxy = proxy
       guard()
@@ -1189,11 +1367,57 @@ export class MagpieWebBridge {
         if (this.generation !== generation || this.child !== child) {
           return
         }
+        // 卸载是**正常**退出，不能再拉起 —— 否则 DSH 关掉后 magpie 还在跑。
+        if (this.disposed) {
+          return
+        }
+
+        // ⚠️⚠️ **必须自动重启**，只清句柄是不够的。
+        //
+        // magpie 自我更新（`POST /api/update/install`）的机制是「下载新
+        // 二进制 → 起新进程 → 老进程退出」。老进程一退，代理就关了；而
+        // 面板的 iframe 早就加载完，**不会**再调 `web.url` RPC 来重建代理。
+        // 结果就是页面里所有 `/api/*` 全部 `ERR_CONNECTION_REFUSED`，用户
+        // 看到「更新功能不可用」—— 必须刷新或重开面板才能恢复。
+        //
+        // 这里补上「退出即拉起」，让代理在 magpie 换版本的瞬间自动重连。
+        this.restartAttempts += 1
+        if (this.restartAttempts > MAX_AUTO_RESTARTS) {
+          logger.warn(
+            `[magpie] web 进程连续退出 ${String(this.restartAttempts)} 次，` +
+              '停止自动重启（手动打开面板或重启 DSH 后再试）',
+          )
+          this.discardHandle()
+          return
+        }
+
+        // 指数退避：1s → 2s → 4s → 8s → 15s（封顶）。
+        // 换版本时第一次几乎立刻成功，退避只在真崩溃时起作用。
+        const attempt = this.restartAttempts
+        const delay = Math.min(1_000 * 2 ** (attempt - 1), 15_000)
         logger.warn(
           `[magpie] web 进程已退出（code=${String(code)}, signal=${String(signal)}），` +
-            '下次打开面板会重新拉起',
+            `${String(delay)}ms 后第 ${String(attempt)} 次自动重启`,
         )
         this.discardHandle()
+        const timer = setTimeout(() => {
+          this.restartTimer = undefined
+          if (this.disposed) {
+            return
+          }
+          void this.ensure()
+            .then(() => {
+              // 起来了就清零，下次退出重新从 1s 开始退避。
+              this.restartAttempts = 0
+            })
+            .catch((error: unknown) => {
+              logger.warn(
+                `[magpie] 自动重启失败：${error instanceof Error ? error.message : String(error)}`,
+              )
+            })
+        }, delay)
+        timer.unref?.()
+        this.restartTimer = timer
       })
 
       return handle

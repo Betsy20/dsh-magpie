@@ -390,6 +390,7 @@ export function apply(ctx: Context, config?: unknown): void {
         key: options.webKey,
         host: options.webHost,
         preferredPort: options.webPort,
+        proxyPort: options.proxyPort,
         gatewayURL: options.baseURL,
         logger,
       })

@@ -62,6 +62,20 @@ export interface MagpieOptions {
   /** 原版 Web UI 的首选端口；被占用时自动向后找空闲端口。 */
   readonly webPort: number
   /**
+   * 代理（DSH iframe 直接加载的那个）的首选端口。
+   *
+   * ⚠️ **必须固定**，不能用 `listen(0)` 让系统随机分配。
+   *
+   * 面板 iframe 的 `src` 在渲染时就定下来了；magpie 自己重启（更新、崩溃、
+   * 被安全软件拦）时代理会重建一次。端口如果是随机的，重建后 URL 就变了，
+   * 而 iframe 还是旧的那个 —— 页面里所有 `/api/*` 请求全部
+   * `ERR_CONNECTION_REFUSED`，用户看到的就是「面板一片白 + 控制台刷红」。
+   *
+   * 固定端口后，magpie 重启只是代理背后换了上游，iframe 的地址不变，刷新
+   * 即可恢复。
+   */
+  readonly proxyPort: number
+  /**
    * 固定的 `MAGPIE_WEB_KEY`。
    *
    * ⚠️ 必须 16 位以上、只含 `[A-Za-z0-9._~-]`，否则 magpie 拒绝启动。
@@ -80,6 +94,8 @@ export const DEFAULT_OPTIONS: MagpieOptions = Object.freeze({
   magpieBinary: 'magpie',
   webHost: '127.0.0.1',
   webPort: 3480,
+  // 3490 = magpie 默认 3480 的 +10 位置，避开它自己和常见的 3481–3489 探测。
+  proxyPort: 3490,
   // 21 位，只含字母/数字/`-`，满足 magpie 的 `[A-Za-z0-9._~-]{16,}` 要求。
   webKey: 'dsh-magpie-panel-2026',
 })
@@ -125,6 +141,11 @@ export const Config = Schema.object({
   webPort: Schema.number()
     .default(3480)
     .description('原版 Web UI 首选端口；被占用时自动向后找空闲端口')
+    .volatile(),
+
+  proxyPort: Schema.number()
+    .default(3490)
+    .description('代理首选端口（固定，避免 magpie 重启后面板 iframe 地址失效）；被占用时向后找')
     .volatile(),
 
   webKey: Schema.string()
@@ -197,6 +218,7 @@ export function resolveOptions(config: unknown): MagpieOptions {
     magpieBinary: string('magpieBinary', DEFAULT_OPTIONS.magpieBinary),
     webHost: string('webHost', DEFAULT_OPTIONS.webHost),
     webPort: port('webPort', DEFAULT_OPTIONS.webPort),
+    proxyPort: port('proxyPort', DEFAULT_OPTIONS.proxyPort),
     webKey: string('webKey', DEFAULT_OPTIONS.webKey),
   })
 }
