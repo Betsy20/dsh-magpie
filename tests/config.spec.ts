@@ -71,6 +71,32 @@ describe('resolveOptions', () => {
     expect(options.webKey).toBe('a'.repeat(20))
   })
 
+  it('proxyPort 默认值落在 magpie 自己的扫描区间之外', () => {
+    // ⚠️ 这条是**回归测试**：默认值一度是 3490，而 `magpie serve` 在端口
+    //    被占时会自己向上找 24 个（3480–3503）。3490 落在里面，用户机器
+    //    上只要有几个 magpie 实例就会把代理端口抢走。
+    const { proxyPort, webPort } = DEFAULT_OPTIONS
+    expect(proxyPort).toBe(3590)
+    expect(proxyPort).toBeGreaterThanOrEqual(webPort + 24)
+  })
+
+  it('proxyPort 合法值被采用、非法值回退', () => {
+    expect(resolveOptions({ proxyPort: 4000 }).proxyPort).toBe(4000)
+    expect(resolveOptions({ proxyPort: 1 }).proxyPort).toBe(1)
+    expect(resolveOptions({ proxyPort: 65_535 }).proxyPort).toBe(65_535)
+    // 越界 / 小数 / 类型不对都回退默认值。
+    expect(resolveOptions({ proxyPort: 0 }).proxyPort).toBe(DEFAULT_OPTIONS.proxyPort)
+    expect(resolveOptions({ proxyPort: -1 }).proxyPort).toBe(DEFAULT_OPTIONS.proxyPort)
+    expect(resolveOptions({ proxyPort: 70_000 }).proxyPort).toBe(DEFAULT_OPTIONS.proxyPort)
+    expect(resolveOptions({ proxyPort: 1.5 }).proxyPort).toBe(DEFAULT_OPTIONS.proxyPort)
+    expect(resolveOptions({ proxyPort: '3490' }).proxyPort).toBe(DEFAULT_OPTIONS.proxyPort)
+  })
+
+  it('proxyPort 经 Volatile 解包后不丢', () => {
+    const options = resolveOptions(throughSchema({ proxyPort: 4123 }))
+    expect(options.proxyPort).toBe(4123)
+  })
+
   it('返回的对象被冻结', () => {
     expect(Object.isFrozen(resolveOptions(undefined))).toBe(true)
   })
@@ -97,6 +123,7 @@ describe('resolveOptions 解包 schemastery 的 Volatile', () => {
       autoDownloadMagpie: false,
       magpieBinary: '/custom/path/magpie.exe',
       webHost: '0.0.0.0',
+      proxyPort: 4123,
       webKey: 'a'.repeat(20),
     })
 
@@ -108,6 +135,7 @@ describe('resolveOptions 解包 schemastery 的 Volatile', () => {
     expect(options.autoDownloadMagpie).toBe(false)
     expect(options.magpieBinary).toBe('/custom/path/magpie.exe')
     expect(options.webHost).toBe('0.0.0.0')
+    expect(options.proxyPort).toBe(4123)
     expect(options.webKey).toBe('a'.repeat(20))
   })
 

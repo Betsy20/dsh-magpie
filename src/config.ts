@@ -85,6 +85,28 @@ export interface MagpieOptions {
   readonly webKey: string
 }
 
+/**
+ * 代理端口的出厂默认值。
+ *
+ * ## 为什么是 3590
+ *
+ * magpie 默认 web 端口是 3480，而 `magpie serve --web=host:port` 在端口被
+ * 占时会**自己向上找**，最多试 24 个（见 `web-bridge.ts` 的
+ * `DEFAULT_PORT_ATTEMPTS`）—— 也就是 **3480–3503**。
+ *
+ * 3590 = 3480 + 110，稳稳落在这个扫描区间**之外**。
+ *
+ * ## ⚠️ 为什么不能是 3490（旧值）
+ *
+ * 3490 落在 3480–3503 **里面**。用户机器上只要同时跑着 11 个以上 magpie
+ * 实例（或别的服务占了那几个端口），magpie 自己就会把 3490 抢走，代理
+ * 再 `listen` 就 `EADDRINUSE`，`ensure()` 直接失败。
+ *
+ * 旧注释写的「避开 magpie 可能用掉的 3481–3489」是**错的** —— 扫描上界
+ * 是 `3480 + 24 - 1 = 3503`，不是 3489。
+ */
+export const DEFAULT_PROXY_PORT = 3590
+
 /** 出厂默认值。 */
 export const DEFAULT_OPTIONS: MagpieOptions = Object.freeze({
   baseURL: DEFAULT_BASE_URL,
@@ -94,8 +116,8 @@ export const DEFAULT_OPTIONS: MagpieOptions = Object.freeze({
   magpieBinary: 'magpie',
   webHost: '127.0.0.1',
   webPort: 3480,
-  // 3490 = magpie 默认 3480 的 +10 位置，避开它自己和常见的 3481–3489 探测。
-  proxyPort: 3490,
+  // 3590 在 magpie 的 3480–3503 扫描区间之外，见 DEFAULT_PROXY_PORT 的注释。
+  proxyPort: DEFAULT_PROXY_PORT,
   // 21 位，只含字母/数字/`-`，满足 magpie 的 `[A-Za-z0-9._~-]{16,}` 要求。
   webKey: 'dsh-magpie-panel-2026',
 })
@@ -144,7 +166,7 @@ export const Config = Schema.object({
     .volatile(),
 
   proxyPort: Schema.number()
-    .default(3490)
+    .default(DEFAULT_PROXY_PORT)
     .description('代理首选端口（固定，避免 magpie 重启后面板 iframe 地址失效）；被占用时向后找')
     .volatile(),
 
