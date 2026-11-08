@@ -1524,6 +1524,29 @@ function isProcessAlive(pid: number | undefined): boolean {
       this.options.proxyPort ?? DEFAULT_PROXY_PORT,
     )
       .then(({ server, port }) => {
+        // ⚠️ 卸载**可能**发生在这行之前的 `listen()` 期间：`dispose()` 是
+        //    同步的，而 `startProxy()` 要等端口真正绑好才 resolve。那一刻
+        //    `closeProxy()` 已经跑完、`this.proxy` 还是 `undefined`，这里
+        //    再赋值就等于把刚绑上的监听 socket 挂到一个**已经废弃**的桥上：
+        //    端口在整个宿主进程生命周期里泄漏（下次重载只能改用 +1 端口），
+        //    而 `Server` 的句柄还会把事件循环吊住、拖慢 DSH 退出。
+        //
+        //    `start()` 在 `await ensureProxy()` 之后有 `guard()`，能挡住
+        //    「写回句柄」，但**挡不住这个已经发生的 `listen`** —— 必须由
+        //    这里自己关掉，再让 reject 走 `start()` 的 catch 收尾。
+        if (this.disposed) {
+          try {
+            server.closeAllConnections?.()
+          } catch {
+            /* 刚绑上，还没有连接；关不掉也无所谓 */
+          }
+          try {
+            server.close()
+          } catch {
+            /* 同上 —— 清理路径不该掩盖真正的卸载原因 */
+          }
+          throw new Error('Web 桥已卸载')
+        }
         this.proxy = server
         this.proxyPort = port
         return { server, port }
