@@ -80,10 +80,29 @@ node scripts/build.mjs
 | `webEnabled` | `true` | 是否嵌入原版 Web UI（关掉就只剩一个空面板） |
 | `webHost` | `127.0.0.1` | Web UI 监听地址 |
 | `webPort` | `3480` | 首选端口（占用时自动向后找空闲端口） |
+| `proxyPort` | `3590` | 代理端口（iframe 直接加载的地址；**固定不变**，见下） |
 | `webKey` | *(固定串)* | `MAGPIE_WEB_KEY`，需 16+ 个 `[A-Za-z0-9._~-]` |
 | `autoStartGateway` | `true` | 插件加载时后台起 `magpie serve --web` |
 | `autoDownloadMagpie` | `true` | 找不到二进制时从 GitHub 下载（~69 MB） |
 | `magpieBinary` | `magpie` | 可执行文件路径（绝对路径优先） |
+
+### 为什么有两个端口
+
+`webPort`（`magpie serve --web`）和 `proxyPort`（插件自己起的反向代理）是**两个
+独立的监听**，不是笔误：
+
+- **`webPort` 会被 magpie 自己挤走**。`magpie serve --web` 发现端口被占时会自己
+  向后找一个（`3480` → `3503`），插件只能事后探测出它最终落在哪。
+- **`proxyPort` 必须固定**。iframe 的 `src` 一旦加载就不会变，端口漂移 = 面板里
+  所有 `/api/*` 请求全部 `ERR_CONNECTION_REFUSED`，白屏且**不会自己恢复**。
+
+所以代理是**常驻**的：`magpie` 重启（自我更新、崩溃）时代理不重建，只把上游引用
+换成 `undefined`（期间回 `503` + `retry-after: 1`），新进程就绪后再指回去。端口
+和 iframe URL 全程不变。
+
+`proxyPort` 默认 `3590` 而不是 `3490`，是因为 `magpie` 自己的扫描区间是
+**`3480`–`3503`** —— 旧值 `3490` 落在里面，用户机器上只要有几个 magpie 实例
+就会把代理端口抢走。
 
 ### 二进制从哪来（四级回退）
 
@@ -331,6 +350,11 @@ PATH 里的 `D:\nodejs\node.exe`（v24.15.0）跑 vitest 会 `ERR_IPC_CHANNEL_CL
   `系统找不到指定的路径`。
 - **`wmic` 在 Windows 11 已移除**。查进程改用 `Get-Process -Name 'xxx'`
   或 `Get-CimInstance Win32_Process`。
+- **不要「按可执行文件路径」清理 magpie 进程**。`~/.dsh/magpie/bin/magpie.exe`
+  是**所有 DSH 窗口共享**的，按 `Win32_Process.ExecutablePath` 匹配再
+  `taskkill /T /F` 会杀掉别的窗口正在用的实例，甚至杀掉自我更新刚拉起的
+  新进程（此时它正在替换二进制，可能损坏更新）。「magpie 退出了就重新
+  拉起」已经足够，不需要额外的孤儿清理。
 
 ## License
 
